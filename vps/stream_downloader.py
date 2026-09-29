@@ -122,7 +122,17 @@ async def download_m3u8_stream(
     )
     discovered: dict[int, tuple[str, int]] = {}
 
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    connector = aiohttp.TCPConnector(
+        limit=12,
+        limit_per_host=12,
+        ttl_dns_cache=300,
+        enable_cleanup_closed=True,
+    )
+
+    async with aiohttp.ClientSession(
+        timeout=timeout,
+        connector=connector,
+    ) as session:
         status, playlist = await _fetch_text(session, m3u8_url, headers)
         if status < 200 or status >= 300:
             raise RuntimeError(f"Failed to fetch M3U8 playlist: HTTP {status}")
@@ -191,15 +201,33 @@ async def download_m3u8_stream(
             raise RuntimeError("M3U8 playlist contained no video segments.")
 
         temp_ts = output_path.with_suffix(output_path.suffix + ".temp.ts")
+        segment_dir = output_path.parent / f"{output_path.stem}.segments"
         total_bytes = 0
 
         try:
-            with temp_ts.open("wb") as output:
-                total_chunks = len(indices)
+            segment_dir.mkdir(parents=True, exist_ok=True)
+            total_chunks = len(indices)
+            try:
+                concurrency = max(
+                    1,
+                    min(
+                        8,
+                        int(os.getenv("HLS_SEGMENT_CONCURRENCY", "4")),
+                    ),
+                )
+            except (TypeError, ValueError):
+                concurrency = 4
 
-                for position, index in enumerate(indices, 1):
-                    segment_url, _ = discovered[index]
+            completed = 0
+            progress_lock = asyncio.Lock()
+            semaphore = asyncio.Semaphore(concurrency)
 
+            async def fetch_segment(position: int, index: int) -> tuple[int, Path, int]:
+                nonlocal completed
+                segment_url, _ = discovered[index]
+                part_path = segment_dir / f"{position:05d}.part.ts"
+
+                async with semaphore:
                     async with session.get(
                         segment_url,
                         headers=headers,
@@ -211,15 +239,50 @@ async def download_m3u8_stream(
                                 f"HTTP {response.status}"
                             )
 
-                        async for chunk in response.content.iter_chunked(1024 * 1024):
+                        segment_bytes = 0
+                        with part_path.open("wb") as part:
+                            async for chunk in response.content.iter_chunked(1024 * 1024):
+                                part.write(chunk)
+                                segment_bytes += len(chunk)
+
+                async with progress_lock:
+                    completed += 1
+                    percent = round(completed * 100 / total_chunks)
+                    if progress:
+                        result = progress(percent, completed, total_chunks)
+                        if asyncio.iscoroutine(result):
+                            await result
+
+                return position, part_path, segment_bytes
+
+            # The previous implementation downloaded chunks strictly one after
+            # another. TeraBox HLS chunks are independent, so several can be
+            # fetched simultaneously. We still concatenate them in index order,
+            # preserving the exact transport-stream sequence.
+            results = await asyncio.gather(
+                *(
+                    fetch_segment(position, index)
+                    for position, index in enumerate(indices, 1)
+                )
+            )
+
+            results.sort(key=lambda item: item[0])
+            with temp_ts.open("wb") as output:
+                for _, part_path, segment_bytes in results:
+                    with part_path.open("rb") as part:
+                        while True:
+                            chunk = part.read(1024 * 1024)
+                            if not chunk:
+                                break
                             output.write(chunk)
                             total_bytes += len(chunk)
 
-                    percent = round(position * 100 / total_chunks)
-                    if progress:
-                        result = progress(percent, position, total_chunks)
-                        if asyncio.iscoroutine(result):
-                            await result
+            log.info(
+                "HLS segment download complete chunks=%s bytes=%s concurrency=%s",
+                total_chunks,
+                total_bytes,
+                concurrency,
+            )
 
             ffmpeg = (
                 os.getenv("FFMPEG_PATH", "").strip()
@@ -261,6 +324,8 @@ async def download_m3u8_stream(
         finally:
             temp_ts.unlink(missing_ok=True)
             temp_output.unlink(missing_ok=True)
+            import shutil
+            shutil.rmtree(segment_dir, ignore_errors=True)
 
     size = output_path.stat().st_size if output_path.exists() else 0
     if size <= 0:
