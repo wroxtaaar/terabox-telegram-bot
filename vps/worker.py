@@ -247,7 +247,9 @@ class Worker:
             self.api_hash,
         )
 
-        self.resolver = TeraBoxBrowserResolver(max_concurrent=1)
+        # Inspect metadata concurrently so the ready-download queue fills
+        # quickly while the single active download runs independently.
+        self.resolver = TeraBoxBrowserResolver(max_concurrent=2)
 
         self.size_inspection_queue: list[QueueTask] = []
         # Min-heap ordered by file size, then enqueue time, then task id.
@@ -780,60 +782,108 @@ class Worker:
 
     # ---------- size inspection ----------
 
+    async def _inspect_one_task(self, task: QueueTask) -> None:
+        """Inspect one link and promote it immediately when metadata is ready."""
+        self.inspecting_task = task
+        try:
+            log.info("task=%s inspecting TeraBox metadata", task.task_id)
+            metadata = await self.resolver.resolve(
+                task.url,
+                allow_native_download=False,
+            )
+            files = [
+                item for item in (metadata.get("files") or [])
+                if isinstance(item, dict) and not item.get("is_dir")
+            ]
+            if not files and metadata.get("file_name"):
+                files = [{
+                    "file_name": metadata.get("file_name"),
+                    "size": int(metadata.get("size") or 0),
+                    "fs_id": metadata.get("fs_id") or "",
+                    "direct_url": metadata.get("direct_url") or "",
+                    "stream_url": metadata.get("stream_url") or "",
+                }]
+
+            task.file_names = [
+                safe_filename(str(item.get("file_name") or "terabox-file"))
+                for item in files
+            ]
+            total = sum(int(item.get("size") or 0) for item in files)
+            known = self._known_downloaded_size(task.url)
+            task.size_bytes = known if known is not None else total
+            task.size_is_estimated = known is None
+
+            if not task.file_names:
+                task.file_names = []
+                task.size_bytes = None
+        except Exception as exc:
+            log.warning(
+                "task=%s metadata inspection failed: %s",
+                task.task_id,
+                self._compact_error(exc),
+            )
+            task.file_names = []
+            task.size_bytes = None
+            task.size_is_estimated = False
+        finally:
+            self.inspecting_task = None
+
+        if not task.cancel_requested:
+            self._push_download_task(task)
+            self.download_event.set()
+            log.info(
+                "task=%s moved to download queue size=%s ready=%s",
+                task.task_id,
+                task.size_bytes if task.size_bytes is not None else "unknown",
+                len(self.download_queue),
+            )
+
     async def _size_inspection_loop(self):
+        # Two metadata resolutions can run concurrently. Each completed task
+        # is promoted immediately; there is no batch barrier.
+        max_parallel = 2
+        pending: set[asyncio.Task] = set()
+
         while not self.stop_event.is_set():
             await self.size_event.wait()
             self.size_event.clear()
 
-            while self.size_inspection_queue and not self.stop_event.is_set():
-                task = self.size_inspection_queue.pop(0)
-                if task.cancel_requested:
-                    continue
+            while (
+                (self.size_inspection_queue or pending)
+                and not self.stop_event.is_set()
+            ):
+                while (
+                    self.size_inspection_queue
+                    and len(pending) < max_parallel
+                    and not self.stop_event.is_set()
+                ):
+                    task = self.size_inspection_queue.pop(0)
+                    if task.cancel_requested:
+                        continue
+                    pending.add(asyncio.create_task(self._inspect_one_task(task)))
 
-                self.inspecting_task = task
-                try:
-                    log.info("task=%s inspecting TeraBox metadata", task.task_id)
-                    metadata = await self.resolver.resolve(task.url, allow_native_download=False)
-                    files = [
-                        item for item in (metadata.get("files") or [])
-                        if isinstance(item, dict) and not item.get("is_dir")
-                    ]
-                    if not files and metadata.get("file_name"):
-                        files = [{
-                            "file_name": metadata.get("file_name"),
-                            "size": int(metadata.get("size") or 0),
-                            "fs_id": metadata.get("fs_id") or "",
-                            "direct_url": metadata.get("direct_url") or "",
-                            "stream_url": metadata.get("stream_url") or "",
-                        }]
+                if not pending:
+                    break
 
-                    task.file_names = [
-                        safe_filename(str(item.get("file_name") or "terabox-file"))
-                        for item in files
-                    ]
-                    total = sum(int(item.get("size") or 0) for item in files)
-                    known = self._known_downloaded_size(task.url)
-                    task.size_bytes = known if known is not None else total
-                    task.size_is_estimated = known is None
+                done, pending = await asyncio.wait(
+                    pending,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
 
-                    if not task.file_names:
-                        task.file_names = []
-                        task.size_bytes = None
-                except Exception as exc:
-                    log.warning(
-                        "task=%s metadata inspection failed: %s",
-                        task.task_id,
-                        self._compact_error(exc),
-                    )
-                    task.file_names = []
-                    task.size_bytes = None
-                    task.size_is_estimated = False
-                finally:
-                    self.inspecting_task = None
+                for completed in done:
+                    try:
+                        await completed
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        log.exception(
+                            "Unhandled metadata inspection task failure"
+                        )
 
-                if not task.cancel_requested:
-                    self._push_download_task(task)
-                    self.download_event.set()
+        for pending_task in pending:
+            pending_task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
     # ---------- download queue ----------
 
