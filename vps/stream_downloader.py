@@ -15,7 +15,7 @@ ProgressCallback = Callable[[int, int, int], Awaitable[None] | None]
 
 def _chunk_url_with_full_range(segment_url: str) -> tuple[int, str, int]:
     parsed = urlparse(segment_url)
-    match = re.search(r"_(\d+)_ts\b", parsed.path, re.IGNORECASE)
+    match = re.search(r"_(\d+)_ts\b", segment_url, re.IGNORECASE)
     chunk_index = int(match.group(1)) if match else 0
 
     params = dict(parse_qsl(parsed.query, keep_blank_values=True))
