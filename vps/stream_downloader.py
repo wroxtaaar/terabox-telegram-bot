@@ -137,17 +137,17 @@ async def download_m3u8_stream(
 
         if effective_share_id and effective_uk and effective_fid and effective_sign and effective_timestamp:
             try:
-                max_scan_time = max(30, int(duration) + 30) if duration else 7200
+                # The streaming endpoint can return one randomly selected
+                # transport-stream chunk per request. Do not assume that
+                # time=25,50,... selects a deterministic timeline window.
+                duration_seconds = int(duration) if duration else 0
             except (TypeError, ValueError):
-                max_scan_time = 7200
+                duration_seconds = 0
 
-            step = 25
-            empty_streak = 0
+            estimated_chunks = max(1, (duration_seconds + 239) // 240) if duration_seconds else 1
+            request_budget = min(100, max(30, estimated_chunks * 3))
+            no_new_streak = 0
 
-            # Preserve the complete signed query from the browser-exposed
-            # stream URL while changing only the timeline position. In
-            # particular, this keeps jsToken and any other browser-issued
-            # parameters that are required for later HLS windows.
             base_query = dict(parse_qsl(parsed.query, keep_blank_values=True))
             base_query.setdefault("app_id", "250528")
             base_query.setdefault("web", "1")
@@ -159,35 +159,62 @@ async def download_m3u8_stream(
             base_query.setdefault("sign", effective_sign)
             base_query.setdefault("timestamp", effective_timestamp)
             base_query.setdefault("type", "M3U8_AUTO_480")
+            base_query.setdefault("start", "0")
             base_query.setdefault("esl", "1")
             base_query.setdefault("isplayer", "1")
             base_query.setdefault("ehps", "1")
 
-            for t in range(step, max_scan_time + 1, step):
-                time_query = dict(base_query)
-                time_query["time"] = str(t)
-                time_url = "https://www.terabox.app/share/streaming?" + urlencode(time_query)
+            for attempt in range(1, request_budget + 1):
+                poll_query = dict(base_query)
+                poll_query["start"] = "0"
+                poll_url = "https://www.terabox.app/share/streaming?" + urlencode(poll_query)
 
                 try:
-                    time_status, time_playlist = await _fetch_text(
+                    poll_status, poll_playlist = await _fetch_text(
                         session,
-                        time_url,
+                        poll_url,
                         headers,
                     )
-                    if time_status < 200 or time_status >= 300:
+                    if poll_status < 200 or poll_status >= 300:
+                        no_new_streak += 1
                         continue
 
                     before = len(discovered)
-                    discovered.update(_parse_segments(time_playlist, time_url))
+                    discovered.update(_parse_segments(poll_playlist, poll_url))
+                    added = len(discovered) - before
 
-                    if len(discovered) > before:
-                        empty_streak = 0
+                    if added:
+                        no_new_streak = 0
+                        log.debug(
+                            "HLS poll %s/%s added=%s total=%s",
+                            attempt,
+                            request_budget,
+                            added,
+                            len(discovered),
+                        )
                     else:
-                        empty_streak += 1
-                        if not duration and empty_streak >= 4 and discovered:
-                            break
-                except Exception:
-                    continue
+                        no_new_streak += 1
+
+                    # Once we have a contiguous set beginning at zero/one and
+                    # have seen several consecutive responses with no new
+                    # indices, further polling is unlikely to add anything.
+                    if discovered:
+                        indices_now = sorted(discovered)
+                        first_index = indices_now[0]
+                        contiguous = all(
+                            b == a + 1 for a, b in zip(indices_now, indices_now[1:])
+                        )
+                        if first_index <= 1 and contiguous:
+                            expected = estimated_chunks
+                            if len(indices_now) >= expected and no_new_streak >= 5:
+                                break
+                            if not duration_seconds and no_new_streak >= 10:
+                                break
+                except Exception as exc:
+                    no_new_streak += 1
+                    if no_new_streak <= 2:
+                        log.debug("HLS poll %s failed: %s", attempt, exc)
+
 
         indices = sorted(discovered)
         if not indices:
