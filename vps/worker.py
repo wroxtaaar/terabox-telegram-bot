@@ -404,7 +404,8 @@ class Worker:
         self.telegram_task = asyncio.create_task(self._connect_telegram_with_retry())
 
         log.info(
-            "VPS worker started; queue management and Telegram authorization are running in the background."
+            "VPS worker started; ready downloads begin immediately while remaining "
+            "queue items continue metadata inspection in the background."
         )
 
     async def stop(self):
@@ -544,8 +545,8 @@ class Worker:
             await event.reply(
                 "📖 Help\n\n"
                 "1. Paste a TeraBox share link.\n"
-                "2. The bot inspects file names and sizes first.\n"
-                "3. Downloads are processed smallest-first once their sizes are known.\n"
+                "2. The bot inspects file names and sizes in the background.\n"
+                "3. Downloading starts as soon as a task is sized; ready tasks are processed smallest-first.\n"
                 "4. ZIP archives are unpacked automatically.\n"
                 "5. Videos use streamable Telegram delivery when possible.\n"
                 "6. Large files use direct MTProto upload first; if that fails, the bot splits them into parts.\n\n"
@@ -842,8 +843,9 @@ class Worker:
             self.download_event.clear()
 
             while self.download_queue and not self.stop_event.is_set():
-                if self.inspecting_task or self.size_inspection_queue:
-                    break
+                # Do not wait for the remaining metadata-inspection queue.
+                # Start immediately with the smallest task whose size is already
+                # known, while the size inspector continues working in parallel.
                 task = self._next_download_task()
                 if not task:
                     break
