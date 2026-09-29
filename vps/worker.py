@@ -77,6 +77,9 @@ class Worker:
         log.info("Starting Chromium resolver...")
         await self.resolver.start()
 
+        log.info("Removing any legacy Telegram Bot API webhook...")
+        await self._delete_bot_api_webhook()
+
         log.info("Starting Telegram MTProto bot client on VPS...")
         await self.telegram.start(bot_token=self.bot_token)
 
@@ -94,6 +97,19 @@ class Worker:
 
         self.task = asyncio.create_task(self._queue_loop())
         log.info("VPS worker ready; Telegram intake is running directly on Oracle.")
+
+    async def _delete_bot_api_webhook(self):
+        timeout = aiohttp.ClientTimeout(total=15, connect=8)
+        api_url = f"https://api.telegram.org/bot{self.bot_token}/deleteWebhook"
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                api_url,
+                json={"drop_pending_updates": False},
+            ) as response:
+                data = await response.json(content_type=None)
+                if response.status >= 400 or not data.get("ok"):
+                    raise RuntimeError(f"Telegram deleteWebhook failed: {data}")
+        log.info("Telegram Bot API webhook removed; Oracle will receive updates via MTProto.")
 
     async def stop(self):
         if self.task:
