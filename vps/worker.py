@@ -976,6 +976,7 @@ class Worker:
 
                 downloaded_path: Path | None = None
                 candidate_name = original_name
+                used_hls = False
 
                 try:
                     if (
@@ -1018,6 +1019,7 @@ class Worker:
                             resolved,
                             source,
                         )
+                        used_hls = True
 
                     if downloaded_path is None:
                         raise RuntimeError("The file could not be downloaded.")
@@ -1025,7 +1027,7 @@ class Worker:
                     actual_size = downloaded_path.stat().st_size
                     if actual_size <= 0:
                         raise RuntimeError("Downloaded file is empty.")
-                    if expected_size and actual_size != expected_size:
+                    if expected_size and not used_hls and actual_size != expected_size:
                         raise RuntimeError(
                             f"Downloaded size mismatch: expected {expected_size} bytes, received {actual_size} bytes."
                         )
