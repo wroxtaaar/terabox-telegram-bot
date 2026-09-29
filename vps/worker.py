@@ -1273,7 +1273,8 @@ class Worker:
                 )
             return path, total
         except Exception:
-            path.unlink(missing_ok=True)
+            if path.exists():
+                path.unlink(missing_ok=True)
             raise
 
     async def _download_hls(
@@ -1286,13 +1287,15 @@ class Worker:
         source: dict,
     ) -> tuple[Path, int]:
         suffix = Path(filename).suffix or ".mp4"
-        fd, temp_name = tempfile.mkstemp(
-            prefix=f"terabox-hls-{task.task_id}-",
-            suffix=suffix,
-            dir=str(DOWNLOADS_DIR / "active"),
-        )
-        os.close(fd)
-        path = Path(temp_name)
+        active_dir = DOWNLOADS_DIR / "active"
+        active_dir.mkdir(parents=True, exist_ok=True)
+
+        # Do not pre-create the final output file. FFmpeg owns the final
+        # destination and will atomically create/replace it after remuxing.
+        # Pre-creating a zero-byte output can cause inconsistent behavior on
+        # some FFmpeg/filesystem combinations.
+        output_name = f"terabox-hls-{task.task_id}-{uuid.uuid4().hex}{suffix}"
+        path = active_dir / output_name
 
         last_status = 0.0
         last_percent = -1
@@ -1313,6 +1316,11 @@ class Worker:
                 )
 
         try:
+            log.info(
+                "task=%s starting HLS download output=%s",
+                task.task_id,
+                path,
+            )
             await download_m3u8_stream(
                 stream_url,
                 path,
@@ -1331,6 +1339,10 @@ class Worker:
                 randsk=str(resolved.get("randsk") or ""),
                 progress=progress,
             )
+            if not path.exists():
+                raise RuntimeError(
+                    f"HLS downloader returned successfully but output file is missing: {path}"
+                )
             size = path.stat().st_size
             if size <= 0:
                 raise RuntimeError("M3U8 download produced an empty output file.")
