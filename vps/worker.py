@@ -17,6 +17,7 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
 from .browser_resolver import TeraBoxBrowserResolver
+from .stream_downloader import download_m3u8_stream
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -196,15 +197,20 @@ class Worker:
             )
             size = int(resolved.get("size") or 0)
             direct_url = str(resolved.get("direct_url") or "").strip()
+            stream_url = str(resolved.get("stream_url") or "").strip()
+            download_mode = str(resolved.get("download_mode") or "").strip()
 
-            if not direct_url:
-                raise RuntimeError("Resolver returned no direct download URL.")
+            if not direct_url and not stream_url:
+                raise RuntimeError(
+                    "Resolver returned neither a direct download URL nor an HLS stream URL."
+                )
 
             log.info(
-                "job=%s resolved file=%s size=%s resolve_ms=%s",
+                "job=%s resolved file=%s size=%s mode=%s resolve_ms=%s",
                 job.job_id,
                 filename,
                 size,
+                download_mode or ("direct" if direct_url else "stream"),
                 resolved.get("resolve_ms"),
             )
 
@@ -213,9 +219,17 @@ class Worker:
                 f"✅ Resolved: {filename}\n⬇️ Starting download…",
             )
 
-            temp_path, downloaded_size = await self._download(
-                job, direct_url, filename, expected_size=size
-            )
+            if stream_url and not direct_url:
+                temp_path, downloaded_size = await self._download_stream(
+                    job,
+                    stream_url,
+                    filename,
+                    resolved,
+                )
+            else:
+                temp_path, downloaded_size = await self._download(
+                    job, direct_url, filename, expected_size=size
+                )
 
             await self._status(job, f"📤 Uploading {filename} to Telegram…")
 
@@ -351,6 +365,74 @@ class Worker:
             )
 
         return path, total
+
+    async def _download_stream(
+        self,
+        job: Job,
+        stream_url: str,
+        filename: str,
+        resolved: dict,
+    ) -> tuple[Path, int]:
+        suffix = Path(filename).suffix or ".mp4"
+        tmp = tempfile.NamedTemporaryFile(
+            prefix=f"terabox-{job.job_id}-",
+            suffix=suffix,
+            delete=False,
+            dir="/tmp",
+        )
+        path = Path(tmp.name)
+        tmp.close()
+
+        last_messenger_update = 0.0
+        last_percent = -1
+
+        async def progress(percent: int, current: int, total: int):
+            nonlocal last_messenger_update, last_percent
+            now = time.monotonic()
+            if (
+                percent == 100
+                or percent >= last_percent + 10
+                and now - last_messenger_update >= 10
+            ):
+                last_percent = percent
+                last_messenger_update = now
+                await self._status(
+                    job,
+                    f"⬇️ Downloading {filename}: {percent}% "
+                    f"({current}/{total} chunks)",
+                )
+
+        try:
+            downloaded_size, chunk_count = await download_m3u8_stream(
+                stream_url,
+                path,
+                referer_url=str(
+                    resolved.get("referer_url")
+                    or "https://www.terabox.app/"
+                ),
+                cookie_header=str(resolved.get("cookies") or ""),
+                duration=int(resolved.get("duration") or 0),
+                share_id=str(
+                    resolved.get("share_id")
+                    or resolved.get("shareid")
+                    or ""
+                ),
+                uk=str(resolved.get("uk") or ""),
+                sign=str(resolved.get("sign") or ""),
+                timestamp=str(resolved.get("timestamp") or ""),
+                fs_id=str(resolved.get("fs_id") or ""),
+                progress=progress,
+            )
+            log.info(
+                "job=%s HLS download completed chunks=%s bytes=%s",
+                job.job_id,
+                chunk_count,
+                downloaded_size,
+            )
+            return path, downloaded_size
+        except Exception:
+            path.unlink(missing_ok=True)
+            raise
 
     async def _send_file(self, chat_id: int, path: Path, filename: str):
         streaming_extensions = {
