@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 from urllib.parse import parse_qs, urlparse
 
@@ -467,6 +468,122 @@ async def _resolve_via_shorturlinfo(
     )
 
 
+
+def _parse_gateway_size(value) -> int:
+    try:
+        if isinstance(value, (int, float)):
+            return int(value)
+        text = str(value or "").strip().upper().replace(",", "")
+        match = re.fullmatch(r"([0-9.]+)\\s*([KMGTP]?B)?", text)
+        if not match:
+            return 0
+        amount = float(match.group(1))
+        unit = match.group(2) or "B"
+        factors = {
+            "B": 1,
+            "KB": 1024,
+            "MB": 1024 ** 2,
+            "GB": 1024 ** 3,
+            "TB": 1024 ** 4,
+            "PB": 1024 ** 5,
+        }
+        return int(amount * factors.get(unit, 1))
+    except (TypeError, ValueError):
+        return 0
+
+
+async def _resolve_via_edge_gateway(session, share_url):
+    """Use a Cloudflare-edge resolver when TeraBox blocks Render's IP."""
+    endpoint = os.getenv(
+        "TERABOX_EDGE_RESOLVER_URL",
+        "https://terabox-worker.robinkumarshakya103.workers.dev/api",
+    ).strip()
+    if not endpoint:
+        raise RuntimeError("Edge resolver is disabled.")
+
+    try:
+        async with session.get(
+            endpoint,
+            params={"url": share_url},
+            headers={
+                "User-Agent": UA,
+                "Accept": "application/json",
+            },
+            allow_redirects=True,
+        ) as response:
+            body = await response.text()
+            if response.status >= 400:
+                raise RuntimeError(
+                    f"Edge resolver HTTP {response.status}: {body[:200]}"
+                )
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    "Edge resolver returned non-JSON."
+                ) from exc
+
+        if not isinstance(data, dict) or not data.get("success"):
+            raise RuntimeError(
+                f"Edge resolver failed: "
+                f"{data.get('error') if isinstance(data, dict) else 'invalid response'}"
+            )
+
+        files = data.get("files")
+        if not isinstance(files, list) or not files:
+            raise RuntimeError("Edge resolver returned no files.")
+
+        normalized = []
+        for item in files:
+            if not isinstance(item, dict):
+                continue
+
+            file_name = str(
+                item.get("file_name")
+                or item.get("filename")
+                or item.get("name")
+                or ""
+            ).strip()
+
+            proxied = str(
+                item.get("download_url")
+                or item.get("original_download_url")
+                or ""
+            ).strip()
+
+            if not proxied:
+                continue
+
+            normalized.append(
+                {
+                    "file_name": file_name,
+                    "size": _parse_gateway_size(item.get("size")),
+                    "fs_id": str(
+                        item.get("fid")
+                        or item.get("fs_id")
+                        or ""
+                    ),
+                    "path": str(item.get("path") or ""),
+                    "is_dir": False,
+                    "direct_url": proxied,
+                    "thumbnail": str(
+                        item.get("thumbnail")
+                        or item.get("thumb")
+                        or ""
+                    ),
+                }
+            )
+
+        if not normalized:
+            raise RuntimeError(
+                "Edge resolver returned no downloadable file URLs."
+            )
+
+        return normalized[0], normalized
+
+
+
+
 async def _origins(session, share_url):
     out = []
     parsed = urlparse(share_url)
@@ -643,6 +760,33 @@ async def resolve_terabox_url(url: str) -> dict:
                     origin,
                     exc,
                 )
+
+        # Render's datacenter IP can be challenged by TeraBox before
+        # the browser token is exposed. Try a separate edge resolver as the
+        # final fallback so the Telegram bot itself remains lightweight.
+        try:
+            row, gateway_rows = await _resolve_via_edge_gateway(
+                session, url
+            )
+            log.info(
+                "TeraBox edge gateway resolved %s",
+                row["file_name"],
+            )
+            return _result(
+                surl,
+                row,
+                gateway_rows,
+            )
+        except (
+            aiohttp.ClientError,
+            asyncio.TimeoutError,
+            RuntimeError,
+        ) as exc:
+            last = exc
+            log.info(
+                "TeraBox edge gateway failed: %s",
+                exc,
+            )
 
         raise RuntimeError(
             f"Could not read the TeraBox share. Last error: {last}"
