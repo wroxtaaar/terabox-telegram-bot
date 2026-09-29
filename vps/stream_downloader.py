@@ -8,6 +8,10 @@ from typing import Awaitable, Callable
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 import aiohttp
+import logging
+
+
+log = logging.getLogger("terabox-vps-worker")
 
 
 ProgressCallback = Callable[[int, int, int], Awaitable[None] | None]
