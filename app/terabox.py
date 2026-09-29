@@ -493,10 +493,10 @@ def _parse_gateway_size(value) -> int:
 
 
 async def _resolve_via_remote_service(session, share_url):
-    """Ask the dedicated resolver service to resolve the TeraBox share."""
+    """Ask the dedicated Chromium resolver service to resolve the TeraBox share."""
     endpoint = os.getenv(
         "TERABOX_RESOLVER_URL",
-        "https://terabox-resolver-lc2i.onrender.com/resolve",
+        "https://terabox-resolver-browser.onrender.com/resolve",
     ).strip()
     secret = os.getenv("TERABOX_RESOLVER_SECRET", "").strip()
 
@@ -510,23 +510,45 @@ async def _resolve_via_remote_service(session, share_url):
     if secret:
         headers["X-Resolver-Secret"] = secret
 
-    async with session.get(
-        endpoint,
-        params={"url": share_url},
-        headers=headers,
-        allow_redirects=True,
-    ) as response:
-        body = await response.text()
-        if response.status >= 400:
-            raise RuntimeError(
-                f"Remote resolver HTTP {response.status}: {body[:240]}"
+    remote_timeout = aiohttp.ClientTimeout(
+        total=60,
+        connect=15,
+        sock_read=55,
+    )
+    log.info(
+        "Calling remote TeraBox resolver: %s",
+        urlparse(endpoint).netloc,
+    )
+
+    # Use a fresh/default DNS session. The bot's TeraBox session uses a
+    # threaded resolver and a 20s global timeout, which can expire before
+    # a separate Render service has accepted a request.
+    async with aiohttp.ClientSession(
+        timeout=remote_timeout,
+        cookie_jar=aiohttp.CookieJar(),
+    ) as remote_session:
+        async with remote_session.get(
+            endpoint,
+            params={"url": share_url},
+            headers=headers,
+            allow_redirects=True,
+        ) as response:
+            body = await response.text()
+            log.info(
+                "Remote resolver HTTP %s from %s",
+                response.status,
+                urlparse(str(response.url)).netloc,
             )
-        try:
-            data = json.loads(body)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(
-                "Remote resolver returned non-JSON."
-            ) from exc
+            if response.status >= 400:
+                raise RuntimeError(
+                    f"Remote resolver HTTP {response.status}: {body[:240]}"
+                )
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    "Remote resolver returned non-JSON."
+                ) from exc
 
     if not isinstance(data, dict) or not data.get("success"):
         raise RuntimeError(
@@ -638,6 +660,32 @@ async def resolve_terabox_url(url: str) -> dict:
         cookie_jar=aiohttp.CookieJar(),
     ) as session:
         last = None
+
+        # Prefer the dedicated Chromium resolver. Public TeraBox shares
+        # currently do not expose jsToken reliably to raw HTTP clients.
+        try:
+            row, resolver_rows = await _resolve_via_remote_service(
+                session, url
+            )
+            log.info(
+                "Remote Chromium resolver returned %s",
+                row["file_name"],
+            )
+            return _result(
+                surl,
+                row,
+                resolver_rows,
+            )
+        except (
+            aiohttp.ClientError,
+            asyncio.TimeoutError,
+            RuntimeError,
+        ) as exc:
+            last = exc
+            log.info(
+                "Remote Chromium resolver failed, trying direct fallback: %s",
+                repr(exc),
+            )
 
         for origin in await _origins(session, url):
             try:
@@ -760,32 +808,6 @@ async def resolve_terabox_url(url: str) -> dict:
                     origin,
                     exc,
                 )
-
-        # The Telegram bot runs on Render Singapore. If TeraBox blocks that
-        # datacenter, hand the share to the separate resolver service.
-        try:
-            row, resolver_rows = await _resolve_via_remote_service(
-                session, url
-            )
-            log.info(
-                "Remote TeraBox resolver returned %s",
-                row["file_name"],
-            )
-            return _result(
-                surl,
-                row,
-                resolver_rows,
-            )
-        except (
-            aiohttp.ClientError,
-            asyncio.TimeoutError,
-            RuntimeError,
-        ) as exc:
-            last = exc
-            log.info(
-                "Remote TeraBox resolver failed: %s",
-                exc,
-            )
 
         raise RuntimeError(
             f"Could not read the TeraBox share. Last error: {last}"
