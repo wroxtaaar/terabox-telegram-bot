@@ -218,6 +218,7 @@ def _build_stream_url(
     fs_id: str,
     sign: str,
     timestamp: str,
+    js_token: str = "",
 ) -> str:
     if not all((share_id, uk, fs_id, sign, timestamp)):
         return ""
@@ -230,7 +231,9 @@ def _build_stream_url(
         f"&fid={quote_plus(fs_id)}"
         f"&sign={quote_plus(sign)}"
         f"&timestamp={quote_plus(timestamp)}"
+        f"&jsToken={quote_plus(js_token)}"
         "&type=M3U8_AUTO_480"
+        "&esl=1&isplayer=1&ehps=1"
     )
 
 
@@ -606,6 +609,7 @@ class TeraBoxBrowserResolver:
                         fs_id=str(row.get("fs_id") or ""),
                         sign=row_sign,
                         timestamp=row_timestamp,
+                        js_token=js_token,
                     )
                     if stream_url:
                         row["stream_url"] = stream_url
