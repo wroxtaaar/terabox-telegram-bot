@@ -134,6 +134,33 @@ def _normalize_file(row: dict[str, Any]) -> dict[str, Any]:
         or ""
     ).strip()
 
+    thumb_url = str(
+        thumbs.get("url3")
+        or thumbs.get("url2")
+        or thumbs.get("url1")
+        or row.get("thumbnail")
+        or row.get("thumb")
+        or ""
+    ).strip()
+
+    sign = str(row.get("sign") or "").strip()
+    timestamp = str(row.get("timestamp") or "").strip()
+
+    if thumb_url and (not sign or not timestamp):
+        try:
+            thumb_query = parse_qs(urlparse(thumb_url).query)
+            sign = sign or str(thumb_query.get("sign", [""])[0]).strip()
+            timestamp = timestamp or str(
+                thumb_query.get("time", thumb_query.get("timestamp", [""] if "time" not in thumb_query else [])[0])
+            ).strip()
+        except Exception:
+            pass
+
+    try:
+        duration = int(row.get("duration") or 0)
+    except (TypeError, ValueError):
+        duration = 0
+
     return {
         "file_name": str(
             row.get("server_filename")
@@ -147,13 +174,36 @@ def _normalize_file(row: dict[str, Any]) -> dict[str, Any]:
         "is_dir": str(row.get("isdir") or row.get("is_dir") or "0").lower()
         in {"1", "true"},
         "direct_url": direct_url,
-        "thumbnail": str(
-            thumbs.get("url3")
-            or row.get("thumbnail")
-            or row.get("thumb")
-            or ""
-        ).strip(),
+        "stream_url": str(row.get("stream_url") or "").strip(),
+        "thumbnail": thumb_url,
+        "sign": sign,
+        "timestamp": timestamp,
+        "duration": duration,
     }
+
+
+def _build_stream_url(
+    *,
+    share_id: str,
+    uk: str,
+    fs_id: str,
+    sign: str,
+    timestamp: str,
+) -> str:
+    if not all((share_id, uk, fs_id, sign, timestamp)):
+        return ""
+
+    return (
+        "https://www.terabox.app/share/streaming?"
+        f"app_id={APP_ID}&web=1&channel=dubox&clienttype=0"
+        f"&shareid={quote_plus(share_id)}"
+        f"&uk={quote_plus(uk)}"
+        f"&fid={quote_plus(fs_id)}"
+        f"&sign={quote_plus(sign)}"
+        f"&timestamp={quote_plus(timestamp)}"
+        "&type=M3U8_AUTO_480"
+    )
+
 
 
 def _rows(data: Any) -> list[dict[str, Any]]:
@@ -467,8 +517,8 @@ class TeraBoxBrowserResolver:
                         js_token=js_token,
                         share_id=share_id,
                         uk=uk,
-                        sign=sign,
-                        timestamp=timestamp,
+                        sign=sign or row.get("sign", ""),
+                        timestamp=timestamp or row.get("timestamp", ""),
                         fs_id=row["fs_id"],
                     )
                     if dlink:
@@ -476,7 +526,30 @@ class TeraBoxBrowserResolver:
                         direct = row
                         break
 
-            if not direct:
+            # Fallback: the working reference implementation can stream a
+            # video through TeraBox's HLS endpoint even when /share/download
+            # does not return a normal dlink.
+            stream = None
+            if not direct and share_id and uk:
+                for row in file_rows:
+                    if row.get("is_dir") or not row.get("fs_id"):
+                        continue
+
+                    row_sign = row.get("sign") or sign
+                    row_timestamp = row.get("timestamp") or timestamp
+                    stream_url = _build_stream_url(
+                        share_id=share_id,
+                        uk=uk,
+                        fs_id=row["fs_id"],
+                        sign=row_sign,
+                        timestamp=row_timestamp,
+                    )
+                    if stream_url:
+                        row["stream_url"] = stream_url
+                        stream = row
+                        break
+
+            if not direct and not stream:
                 debug = await page.evaluate(
                     """
                     () => ({
@@ -520,23 +593,35 @@ class TeraBoxBrowserResolver:
                     flush=True,
                 )
                 raise RuntimeError(
-                    "Chromium loaded the TeraBox page but no direct file URL was exposed."
+                    "Chromium loaded the TeraBox page but no direct download or stream URL was exposed."
                 )
 
+            selected = direct or stream
+            download_mode = "direct" if direct else "stream"
+
             print(
-                f"resolve success file={direct.get('file_name') or '<unknown>'} "
-                f"size={direct.get('size', 0)}",
+                f"resolve success file={selected.get('file_name') or '<unknown>'} "
+                f"size={selected.get('size', 0)} mode={download_mode}",
                 flush=True,
             )
 
             return {
                 "success": True,
-                "file_name": direct.get("file_name") or "terabox-file",
-                "size": int(direct.get("size") or 0),
-                "fs_id": direct.get("fs_id") or "",
-                "direct_url": direct["direct_url"],
-                "thumbnail": direct.get("thumbnail") or "",
-                "files": file_rows[:50] or [direct],
+                "file_name": selected.get("file_name") or "terabox-file",
+                "size": int(selected.get("size") or 0),
+                "fs_id": selected.get("fs_id") or "",
+                "direct_url": selected.get("direct_url") or "",
+                "stream_url": selected.get("stream_url") or "",
+                "download_mode": download_mode,
+                "thumbnail": selected.get("thumbnail") or "",
+                "sign": selected.get("sign") or sign,
+                "timestamp": selected.get("timestamp") or timestamp,
+                "share_id": share_id,
+                "uk": uk,
+                "duration": int(selected.get("duration") or 0),
+                "cookies": browser_data.get("cookies") or "",
+                "referer_url": page.url,
+                "files": file_rows[:50] or [selected],
                 "surl": surl,
             }
         finally:
