@@ -276,19 +276,35 @@ class TeraBoxBrowserResolver:
 
         print(f"resolve start surl={surl} page={share_page}", flush=True)
 
-        responses: list[tuple[str, int]] = []
+        responses: list[dict[str, Any]] = []
+        response_payloads: list[dict[str, Any]] = []
 
         async def capture(response):
             url = response.url
             if any(
                 marker in url
                 for marker in (
-                    "/share/",
-                    "/api/shorturl",
-                    "/sharing/",
+                    "/share/list",
+                    "/share/download",
+                    "/api/shorturlinfo",
                 )
             ):
-                responses.append((url, response.status))
+                item = {
+                    "url": url,
+                    "status": response.status,
+                    "content_type": response.headers.get("content-type", ""),
+                }
+                responses.append(item)
+                try:
+                    if "json" in item["content_type"].lower():
+                        response_payloads.append(
+                            {
+                                **item,
+                                "body": (await response.text())[:30000],
+                            }
+                        )
+                except Exception:
+                    pass
 
         page.on("response", capture)
 
@@ -393,15 +409,36 @@ class TeraBoxBrowserResolver:
                         if isinstance(x, dict)
                     ]
 
-            if js_token and not file_rows:
-                api_rows, api_meta = await self._browser_shorturlinfo(
+            if js_token:
+                api_rows, api_meta = await self._browser_share_list(
                     page, surl, js_token, dp_logid
                 )
-                file_rows = api_rows
+                if api_rows:
+                    file_rows = api_rows
                 share_id = share_id or api_meta.get("shareid", "")
                 uk = uk or api_meta.get("uk", "")
                 sign = sign or api_meta.get("sign", "")
                 timestamp = timestamp or api_meta.get("timestamp", "")
+
+                if not file_rows:
+                    api_rows, api_meta = await self._browser_shorturlinfo(
+                        page, surl, js_token, dp_logid
+                    )
+                    file_rows = api_rows
+                    share_id = share_id or api_meta.get("shareid", "")
+                    uk = uk or api_meta.get("uk", "")
+                    sign = sign or api_meta.get("sign", "")
+                    timestamp = timestamp or api_meta.get("timestamp", "")
+
+                if not file_rows:
+                    captured_rows, captured_meta = self._extract_api_payloads(
+                        response_payloads
+                    )
+                    file_rows = captured_rows
+                    share_id = share_id or captured_meta.get("shareid", "")
+                    uk = uk or captured_meta.get("uk", "")
+                    sign = sign or captured_meta.get("sign", "")
+                    timestamp = timestamp or captured_meta.get("timestamp", "")
 
             direct = next(
                 (row for row in file_rows if row.get("direct_url")),
@@ -428,39 +465,37 @@ class TeraBoxBrowserResolver:
                         break
 
             if not direct:
-                # Last-resort inspection of the live browser page/network
-                # resources. This is useful when the site's JS changes shape.
-                resource_urls = await page.evaluate(
+                debug = await page.evaluate(
                     """
-                    () => performance.getEntriesByType('resource')
-                      .map(x => x.name)
-                      .filter(x =>
-                        /dlink|download|terabox|1024terabox/i.test(x)
-                      )
-                      .slice(-200)
+                    () => ({
+                      title: document.title,
+                      bodyText: (document.body?.innerText || '').slice(0, 1200),
+                      resourceUrls: performance.getEntriesByType('resource')
+                        .map(x => x.name)
+                        .filter(x => /terabox|download|shorturl|share\//i.test(x))
+                        .slice(-80)
+                    })
                     """
                 )
-                for resource in reversed(resource_urls or []):
-                    if isinstance(resource, str) and (
-                        ".terabox." in resource
-                        or "download" in resource
-                    ):
-                        if "http" in resource and "/sharing/" not in resource:
-                            direct = {
-                                "file_name": "",
-                                "size": 0,
-                                "fs_id": "",
-                                "path": "",
-                                "is_dir": False,
-                                "direct_url": resource,
-                                "thumbnail": "",
-                            }
-                            break
-
-            if not direct:
+                log_line = {
+                    "responses": responses[-20:],
+                    "captured_payloads": [
+                        {
+                            "url": item.get("url"),
+                            "status": item.get("status"),
+                            "content_type": item.get("content_type"),
+                            "body": item.get("body", "")[:2000],
+                        }
+                        for item in response_payloads[-10:]
+                    ],
+                    "page": debug,
+                }
+                print(
+                    "resolve diagnostics=" + json.dumps(log_line, ensure_ascii=False)[:12000],
+                    flush=True,
+                )
                 raise RuntimeError(
-                    "Chromium loaded the TeraBox page but no direct file URL was exposed. "
-                    f"network_samples={responses[-20:]}"
+                    "Chromium loaded the TeraBox page but no direct file URL was exposed."
                 )
 
             print(
@@ -484,6 +519,132 @@ class TeraBoxBrowserResolver:
                 page.remove_listener("response", capture)
             except Exception:
                 pass
+
+    @staticmethod
+    def _errno(data: Any) -> int:
+        if not isinstance(data, dict):
+            return 0
+        try:
+            return int(data.get("errno") or data.get("code") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _extract_api_payloads(
+        payloads: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], dict[str, str]]:
+        for item in reversed(payloads):
+            try:
+                data = json.loads(item.get("body", ""))
+            except Exception:
+                continue
+            if not isinstance(data, dict):
+                continue
+            try:
+                if int(data.get("errno") or data.get("code") or 0):
+                    continue
+            except (TypeError, ValueError):
+                pass
+
+            rows = _rows(data)
+            meta = data.get("data") if isinstance(data.get("data"), dict) else data
+            meta_out = {
+                "shareid": str(
+                    meta.get("shareid")
+                    or meta.get("share_id")
+                    or meta.get("SHARE_ID")
+                    or ""
+                ),
+                "uk": str(meta.get("uk") or meta.get("SHARE_UK") or ""),
+                "sign": str(meta.get("sign") or meta.get("SIGN") or ""),
+                "timestamp": str(
+                    meta.get("timestamp") or meta.get("TIMESTAMP") or ""
+                ),
+            }
+            if rows:
+                return rows, meta_out
+        return [], {}
+
+    async def _browser_share_list(
+        self,
+        page: Page,
+        surl: str,
+        js_token: str,
+        dp_logid: str,
+    ) -> tuple[list[dict[str, Any]], dict[str, str]]:
+        candidates = [surl]
+        if surl.startswith("1"):
+            candidates.append(surl[1:])
+        else:
+            candidates.insert(0, "1" + surl)
+
+        for shorturl in candidates:
+            params = {
+                "app_id": APP_ID,
+                "web": "1",
+                "channel": "dubox",
+                "clienttype": "0",
+                "root": "1",
+                "page": "1",
+                "num": "100",
+                "shorturl": shorturl,
+                "jsToken": js_token,
+            }
+            if dp_logid:
+                params["dp-logid"] = dp_logid
+
+            result = await page.evaluate(
+                """
+                async ({params}) => {
+                  const u = new URL('/share/list', location.origin);
+                  for (const [key, value] of Object.entries(params))
+                    u.searchParams.set(key, value);
+                  const response = await fetch(u.toString(), {
+                    credentials: 'include',
+                    headers: {
+                      'Accept': 'application/json, text/plain, */*',
+                      'X-Requested-With': 'XMLHttpRequest'
+                    }
+                  });
+                  const text = await response.text();
+                  let data = null;
+                  try { data = JSON.parse(text); } catch (_) {}
+                  return {status: response.status, data, text: text.slice(0, 3000)};
+                }
+                """,
+                {"params": params},
+            )
+
+            print(
+                f"share/list shorturl={shorturl} status={result.get('status')} "
+                f"data={'yes' if isinstance(result.get('data'), dict) else 'no'}",
+                flush=True,
+            )
+
+            data = result.get("data")
+            if not isinstance(data, dict) or self._errno(data):
+                continue
+
+            rows = _rows(data)
+            if not rows:
+                continue
+
+            meta = data.get("data") if isinstance(data.get("data"), dict) else data
+            return rows, {
+                "shareid": str(
+                    meta.get("shareid")
+                    or meta.get("share_id")
+                    or meta.get("SHARE_ID")
+                    or ""
+                ),
+                "uk": str(meta.get("uk") or meta.get("SHARE_UK") or ""),
+                "sign": str(meta.get("sign") or meta.get("SIGN") or ""),
+                "timestamp": str(
+                    meta.get("timestamp") or meta.get("TIMESTAMP") or ""
+                ),
+            }
+
+        return [], {}
 
     async def _browser_shorturlinfo(
         self,
