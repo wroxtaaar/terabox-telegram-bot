@@ -151,7 +151,7 @@ def _normalize_file(row: dict[str, Any]) -> dict[str, Any]:
             thumb_query = parse_qs(urlparse(thumb_url).query)
             sign = sign or str(thumb_query.get("sign", [""])[0]).strip()
             timestamp = timestamp or str(
-                thumb_query.get("time", thumb_query.get("timestamp", [""] if "time" not in thumb_query else [])[0])
+                (thumb_query.get("time") or thumb_query.get("timestamp") or [""])[0]
             ).strip()
         except Exception:
             pass
@@ -426,6 +426,7 @@ class TeraBoxBrowserResolver:
             sign = ""
             timestamp = ""
             dp_logid = ""
+            randsk = ""
 
             if isinstance(yun_data, dict):
                 meta = yun_data.get("SHARE_DATA")
@@ -484,6 +485,7 @@ class TeraBoxBrowserResolver:
                 uk = uk or captured_meta.get("uk", "")
                 sign = sign or captured_meta.get("sign", "")
                 timestamp = timestamp or captured_meta.get("timestamp", "")
+                randsk = randsk or captured_meta.get("randsk", "")
 
                 if not file_rows:
                     api_rows, api_meta = await self._browser_shorturlinfo(
@@ -494,6 +496,7 @@ class TeraBoxBrowserResolver:
                     uk = uk or api_meta.get("uk", "")
                     sign = sign or api_meta.get("sign", "")
                     timestamp = timestamp or api_meta.get("timestamp", "")
+                    randsk = randsk or api_meta.get("randsk", "")
 
             log.info(
                 "TeraBox API metadata: files=%s share_id=%s uk=%s",
@@ -619,7 +622,11 @@ class TeraBoxBrowserResolver:
                 "share_id": share_id,
                 "uk": uk,
                 "duration": int(selected.get("duration") or 0),
-                "cookies": browser_data.get("cookies") or "",
+                "cookies": "; ".join(
+                    f"{cookie['name']}={cookie['value']}"
+                    for cookie in await page.context.cookies()
+                ) or browser_data.get("cookies") or "",
+                "randsk": randsk,
                 "referer_url": page.url,
                 "files": file_rows[:50] or [selected],
                 "surl": surl,
@@ -670,6 +677,7 @@ class TeraBoxBrowserResolver:
                 "timestamp": str(
                     meta.get("timestamp") or meta.get("TIMESTAMP") or ""
                 ),
+                "randsk": str(meta.get("randsk") or meta.get("RANDSK") or ""),
             }
             if rows:
                 return rows, meta_out
@@ -752,6 +760,7 @@ class TeraBoxBrowserResolver:
                 "timestamp": str(
                     meta.get("timestamp") or meta.get("TIMESTAMP") or ""
                 ),
+                "randsk": str(meta.get("randsk") or meta.get("RANDSK") or ""),
             }
 
         return [], {}
