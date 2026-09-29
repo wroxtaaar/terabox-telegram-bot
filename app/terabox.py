@@ -1,4 +1,4 @@
-"""Anonymous TeraBox share resolver; no login cookie required."""
+"""TeraBox public-share resolver ported from the working TeraFetch implementation."""
 from __future__ import annotations
 
 import asyncio
@@ -6,44 +6,47 @@ import json
 import logging
 import os
 import re
-from urllib.parse import parse_qs, urlparse
-
-from playwright.async_api import async_playwright
+from urllib.parse import parse_qs, quote, urlparse
 
 import aiohttp
 
 log = logging.getLogger(__name__)
 
-TERABOX_HOSTS = {
-    "terabox.com",
-    "www.terabox.com",
-    "1024terabox.com",
-    "www.1024terabox.com",
-    "teraboxapp.com",
-    "www.teraboxapp.com",
-    "terabox.app",
-    "www.terabox.app",
-    "1024tera.com",
-    "www.1024tera.com",
-    "teraboxlink.com",
-    "www.teraboxlink.com",
-    "terasharelink.com",
-    "www.terasharelink.com",
-    "terasharefile.com",
-    "www.terasharefile.com",
-    "terafileshare.com",
-    "www.terafileshare.com",
-    "teraboxshare.com",
-    "www.teraboxshare.com",
-}
-
 APP_ID = "250528"
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/131.0.0.0 Safari/537.36"
+    "Chrome/126.0.0.0 Safari/537.36"
 )
-TIMEOUT = aiohttp.ClientTimeout(total=20, connect=8)
+TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10)
+
+TERABOX_HOSTS = {
+    "terabox.com",
+    "www.terabox.com",
+    "terabox.app",
+    "www.terabox.app",
+    "teraboxapp.com",
+    "www.teraboxapp.com",
+    "1024tera.com",
+    "www.1024tera.com",
+    "teraboxshare.com",
+    "www.teraboxshare.com",
+    "teraboxlink.com",
+    "www.teraboxlink.com",
+    "nephobox.com",
+    "4funbox.com",
+    "mirrobox.com",
+    "momerybox.com",
+    "tibibox.com",
+    "freeterabox.com",
+    "dubox.com",
+}
+
+BRIDGE_ENDPOINTS = [
+    "https://terabox-api.mn-bots.workers.dev/download?url={url}",
+    "https://terabox-dl.qtcloud.workers.dev/api?url={url}",
+    "https://yt-api-terabox.vercel.app/api?url={url}",
+]
 
 
 def is_terabox_url(value: str) -> bool:
@@ -55,685 +58,388 @@ def is_terabox_url(value: str) -> bool:
 
 
 def extract_surl(value: str) -> str:
-    p = urlparse(value.strip())
-    q = parse_qs(p.query)
+    raw = value.strip()
+    parsed = urlparse(raw)
+    query = parse_qs(parsed.query)
 
-    if q.get("surl"):
-        surl = q["surl"][0].strip()
+    if query.get("surl"):
+        key = query["surl"][0].strip()
+    elif query.get("shorturl"):
+        key = query["shorturl"][0].strip()
     else:
-        m = re.search(r"/s/([A-Za-z0-9_-]+)", p.path)
-        if not m:
-            raise ValueError("Could not extract a TeraBox share code.")
-        surl = m.group(1)
-        if surl.startswith("1") and len(surl) > 1:
-            surl = surl[1:]
+        match = re.search(r"/s/([A-Za-z0-9_-]+)", parsed.path)
+        if match:
+            key = match.group(1)
+        else:
+            parts = [p for p in parsed.path.split("/") if p]
+            key = parts[-1] if parts and len(parts[-1]) >= 8 else ""
 
-    if not re.fullmatch(r"[A-Za-z0-9_-]{8,}", surl):
-        raise ValueError("Invalid TeraBox share code.")
-    return surl
+    if not re.fullmatch(r"[A-Za-z0-9_-]{8,}", key):
+        raise ValueError("Could not extract a TeraBox share code.")
+    return key
 
 
-def _headers(referer: str, *, html: bool = False) -> dict[str, str]:
-    return {
+def _candidate_keys(surl: str) -> list[str]:
+    values = [surl]
+    if surl.startswith("1"):
+        values.append(surl[1:])
+    else:
+        values.append("1" + surl)
+    return list(dict.fromkeys(values))
+
+
+def _headers(referer: str, *, json_request: bool = False, cookie: str = "") -> dict[str, str]:
+    headers = {
         "User-Agent": UA,
         "Accept": (
-            "text/html,application/xhtml+xml,application/json,text/plain,*/*"
-            if html
-            else "application/json, text/plain, */*"
+            "application/json, text/plain, */*"
+            if json_request
+            else "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
         ),
-        "Accept-Language": "en-US,en;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
         "Referer": referer,
-        "X-Requested-With": "XMLHttpRequest",
-        "Sec-Fetch-Site": "same-origin",
-        "Sec-Fetch-Mode": "cors",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
     }
+    if json_request:
+        headers["X-Requested-With"] = "XMLHttpRequest"
+    if cookie:
+        headers["Cookie"] = cookie
+    return headers
 
 
-async def _get_json(session, url, params, referer):
-    async with session.get(
-        url,
-        params=params,
-        headers=_headers(referer),
-        allow_redirects=True,
-    ) as response:
-        body = await response.text()
-        if response.status >= 400:
-            raise RuntimeError(
-                f"TeraBox HTTP {response.status}: {body[:160]}"
-            )
-        try:
-            data = json.loads(body)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError("TeraBox returned non-JSON.") from exc
-        if not isinstance(data, dict):
-            raise RuntimeError("Unexpected TeraBox response.")
-        return data
+def _cookie_header(active_cookie: str, jar: aiohttp.CookieJar) -> str:
+    parts: list[str] = []
+    if active_cookie:
+        value = active_cookie.strip()
+        if value.startswith("ndus="):
+            parts.append(value)
+        else:
+            parts.append(f"ndus={value}")
+    parts.append("lang=en")
+    for cookie in jar:
+        item = f"{cookie.key}={cookie.value}"
+        if item not in parts:
+            parts.append(item)
+    return "; ".join(parts)
 
 
-def _errno(data) -> int:
+def _parse_int(value) -> int:
     try:
-        return int(data.get("errno") or data.get("code") or 0)
+        return int(str(value or "0").replace(",", ""))
     except (TypeError, ValueError):
         return 0
 
 
-def _normalize(row):
-    thumbs = row.get("thumbs") if isinstance(row.get("thumbs"), dict) else {}
-    try:
-        size = int(row.get("size") or 0)
-    except (TypeError, ValueError):
-        size = 0
-
+def _normalize_file(item: dict, source_url: str, share_id: str = "", uk: str = "") -> dict:
+    thumbs = item.get("thumbs") if isinstance(item.get("thumbs"), dict) else {}
+    name = str(
+        item.get("server_filename")
+        or item.get("filename")
+        or item.get("name")
+        or "unnamed_file"
+    ).strip()
+    size = _parse_int(item.get("size"))
+    fs_id = str(item.get("fs_id") or "").strip()
+    dlink = str(
+        item.get("dlink")
+        or item.get("download_url")
+        or item.get("downloadUrl")
+        or ""
+    ).strip()
     return {
-        "file_name": str(
-            row.get("server_filename") or row.get("filename") or ""
-        ).strip(),
+        "file_name": name,
         "size": size,
-        "fs_id": str(row.get("fs_id") or ""),
-        "path": str(row.get("path") or ""),
-        "is_dir": str(row.get("isdir") or "0") in {"1", "true", "True"},
-        "direct_url": str(row.get("dlink") or "").strip(),
-        "thumbnail": str(thumbs.get("url3") or ""),
+        "fs_id": fs_id,
+        "path": str(item.get("path") or ""),
+        "is_dir": str(item.get("isdir") or "0") in {"1", "true", "True"},
+        "direct_url": dlink,
+        "thumbnail": str(
+            thumbs.get("url3")
+            or thumbs.get("url2")
+            or thumbs.get("url1")
+            or item.get("thumb")
+            or ""
+        ),
+        "share_id": share_id,
+        "uk": uk,
+        "source_url": source_url,
     }
 
 
-def _first_list(data):
-    candidates = [
-        data.get("list"),
-        data.get("data", {}).get("list")
-        if isinstance(data.get("data"), dict)
-        else None,
-    ]
-    return next(
-        (value for value in candidates if isinstance(value, list)),
-        [],
+async def _fetch_text(
+    session: aiohttp.ClientSession,
+    url: str,
+    *,
+    headers: dict[str, str],
+    timeout: float,
+) -> tuple[str, aiohttp.ClientResponse]:
+    response = await session.get(
+        url,
+        headers=headers,
+        allow_redirects=True,
+        timeout=timeout,
     )
+    body = await response.text(errors="replace")
+    return body, response
 
 
-async def _extract_tokens_from_response(response):
-    html = await response.text()
-    final_url = str(response.url)
+def _extract_yundata(html: str) -> tuple[str, str, str, str, list[dict]]:
+    share_id = uk = sign = timestamp = ""
+    file_list: list[dict] = []
 
-    js_token = ""
-    token_patterns = (
-        r"window\.jsToken\s*=\s*[\"']([^\"']+)",
-        r"jsToken\s*[:=]\s*[\"']([^\"']+)",
-        r"jsToken[\"']?\s*[:=]\s*[\"']([^\"']+)",
-        r"fn%28%22([^%]+)%22%29",
-        r"fn\(\x22([^\x22]+)\x22\)",
+    match = re.search(r"yunData\s*=\s*({[\s\S]*?});", html)
+    if not match:
+        return share_id, uk, sign, timestamp, file_list
+
+    try:
+        data = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return share_id, uk, sign, timestamp, file_list
+
+    share_id = str(data.get("SHARE_ID") or data.get("share_id") or "")
+    uk = str(data.get("SHARE_UK") or data.get("uk") or "")
+    sign = str(data.get("SIGN") or data.get("sign") or "")
+    timestamp = str(data.get("TIMESTAMP") or data.get("timestamp") or "")
+    if isinstance(data.get("FILE_LIST"), list):
+        file_list = [x for x in data["FILE_LIST"] if isinstance(x, dict)]
+    return share_id, uk, sign, timestamp, file_list
+
+
+def _extract_jstoken(html: str) -> str:
+    patterns = (
+        r"fn%28%22([0-9a-fA-F]+)%22%29",
+        r"fn\(\"([0-9a-fA-F]+)\"\)",
+        r"\"jsToken\"\s*:\s*\"([^\"]+)\"",
+        r"jsToken\s*=\s*['\"]([^'\"]+)['\"]",
+        r"jsToken\s*:\s*['\"]([^'\"]+)['\"]",
     )
-    for pattern in token_patterns:
-        match = re.search(pattern, html)
+    for pattern in patterns:
+        match = re.search(pattern, html, re.IGNORECASE)
         if match:
-            js_token = match.group(1)
-            break
-
-    dp_logid = ""
-    for pattern in (
-        r"dp-logid[=:][\"']?([0-9]+)",
-        r"dp-logid=([0-9]+)",
-    ):
-        match = re.search(pattern, html)
-        if match:
-            dp_logid = match.group(1)
-            break
-
-    if not dp_logid:
-        query = parse_qs(urlparse(final_url).query)
-        dp_logid = (query.get("dp-logid") or [""])[0]
-
-    return final_url, js_token, dp_logid
+            return match.group(1).strip()
+    return ""
 
 
-async def _resolve_via_browser(session, share_url, surl):
-    """Resolve a public share with a fresh in-memory Chromium session."""
-    async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-            ],
+async def _resolve_direct(
+    session: aiohttp.ClientSession,
+    surl: str,
+    full_url: str,
+    active_cookie: str,
+) -> tuple[dict, list[dict]]:
+    candidates = _candidate_keys(surl)
+    primary = candidates[0]
+    target_url = f"https://www.terabox.app/sharing/link?surl={quote(primary)}"
+
+    # Mirror the working Google Studio implementation: fetch the desktop
+    # sharing page, preserve the returned session cookies, then use tokenized
+    # share/list and share/download endpoints on terabox.app.
+    html = ""
+    try:
+        body, response = await _fetch_text(
+            session,
+            target_url,
+            headers=_headers("https://www.terabox.app/", cookie=_cookie_header(active_cookie, session.cookie_jar)),
+            timeout=12,
         )
-        context = await browser.new_context(
-            user_agent=UA,
-            locale="en-US",
-            viewport={"width": 1280, "height": 900},
+        html = body
+        log.warning(
+            "TeraBox share page status=%s final=%s content_length=%s",
+            response.status,
+            response.url,
+            len(html),
         )
-        page = await context.new_page()
-        responses = []
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        log.warning("TeraBox share page fetch failed: %r", exc)
 
-        async def capture_response(response):
-            response_url = response.url
-            if any(
-                marker in response_url
-                for marker in ("/api/shorturlinfo", "/share/list", "/share/download")
-            ):
-                try:
-                    content_type = (
-                        response.headers.get("content-type") or ""
-                    ).lower()
-                    if "json" not in content_type:
-                        return
-                    data = await response.json()
-                    responses.append((response_url, data))
-                except Exception:
-                    pass
+    js_token = _extract_jstoken(html)
+    share_id, uk, sign, timestamp, file_list = _extract_yundata(html)
+    merged_cookie = _cookie_header(active_cookie, session.cookie_jar)
 
-        page.on("response", capture_response)
-
-        try:
-            response = await page.goto(
-                share_url,
-                wait_until="domcontentloaded",
-                timeout=45_000,
-            )
-            log.info(
-                "Chromium share page: status=%s url=%s title=%r",
-                response.status if response else 0,
-                page.url,
-                await page.title(),
-            )
-
-            await page.wait_for_timeout(8_000)
-
-            # Some versions expose jsToken only after the page's JavaScript runs.
-            html = await page.content()
-            scripts = await page.locator("script").all_text_contents()
-            token_text = "\\n".join([html, *scripts])
-            token_match = re.search(
-                r"""(?:jsToken|jstoken|js_token)\\s*["':=]+\\s*["']([^"']+)["']""",
-                token_text,
-                re.IGNORECASE,
-            )
-            js_token = token_match.group(1).strip() if token_match else ""
-
-            if not js_token:
-                try:
-                    js_token = str(
-                        await page.evaluate(
-                            """() => {
-                                for (const key of [
-                                    'jsToken',
-                                    'jstoken',
-                                    'js_token',
-                                    'JSTOKEN'
-                                ]) {
-                                    try {
-                                        if (window[key]) return String(window[key]);
-                                    } catch (_) {}
-                                }
-                                return '';
-                            }"""
-                        )
-                    ).strip()
-                except Exception:
-                    js_token = ""
-
-            # First prefer a file response already made by the share page itself.
-            for response_url, data in responses:
-                if not isinstance(data, dict):
-                    continue
-                rows = [
-                    _normalize(item)
-                    for item in _first_list(data)
-                    if isinstance(item, dict)
-                ]
-                usable = [item for item in rows if item["direct_url"]]
-                if usable:
-                    log.info(
-                        "Chromium captured direct file metadata from %s",
-                        urlparse(response_url).path,
-                    )
-                    return usable[0], rows
-
-            if not js_token:
-                raise RuntimeError(
-                    "Chromium loaded the share but exposed neither jsToken "
-                    "nor a direct file response."
-                )
-
-            origin = (
-                f"{urlparse(page.url).scheme}://"
-                f"{urlparse(page.url).netloc}"
-            )
-            row, rows = await _resolve_via_shorturlinfo(
-                session,
-                origin,
-                page.url,
-                surl,
-                js_token=js_token,
-            )
-            return row, rows
-        finally:
-            await context.close()
-            await browser.close()
-
-
-async def _share_page_tokens(session, share_url, surl, origin):
-    """Try TeraBox share HTML variants until a short-lived jsToken is found."""
-    candidates = [
-        ("share-url", share_url, share_url),
-        (
-            "wap-filelist",
-            f"{origin}/wap/share/filelist?surl={surl}",
-            origin + "/",
-        ),
-        (
-            "wap-filelist-prefixed",
-            f"{origin}/wap/share/filelist?surl=1{surl}",
-            origin + "/",
-        ),
-    ]
-
-    errors = []
-    for label, candidate, referer in candidates:
-        try:
-            async with session.get(
-                candidate,
-                headers=_headers(referer, html=True),
-                allow_redirects=True,
-            ) as response:
-                if response.status >= 400:
-                    errors.append(f"{label}: HTTP {response.status}")
-                    continue
-
-                final_url, js_token, dp_logid = await _extract_tokens_from_response(
-                    response
-                )
-                if js_token:
-                    log.info(
-                        "TeraBox token extracted via %s: origin=%s dp_logid=%s",
-                        label,
-                        urlparse(final_url).netloc,
-                        bool(dp_logid),
-                    )
-                    return final_url, js_token, dp_logid
-
-                errors.append(f"{label}: no jsToken")
-                log.info(
-                    "TeraBox token candidate had no jsToken: %s -> %s",
-                    label,
-                    urlparse(final_url).netloc,
-                )
-        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            errors.append(f"{label}: {exc}")
-
-    raise RuntimeError(
-        "TeraBox share page did not expose jsToken; "
-        + "; ".join(errors)
-    )
-
-
-async def _list_scope(
-    session,
-    origin,
-    surl,
-    js_token,
-    dp_logid,
-    path="/",
-):
-    # The tokenized web endpoint is the important part: unauthenticated
-    # /share/list calls now commonly return errno 400141 on datacenter IPs.
-    params = {
-        "app_id": APP_ID,
-        "web": "1",
-        "channel": "0",
-        "clienttype": "0",
-        "jsToken": js_token,
-        "shorturl": surl,
-        "root": "1" if path == "/" else "0",
-        "page": "1",
-        "num": "100",
-        "by": "name",
-        "order": "asc",
-        "site_referer": "",
-    }
-    if dp_logid:
-        params["dp-logid"] = dp_logid
-    if path != "/":
-        params["dir"] = path
-
-    data = await _get_json(
-        session,
-        f"{origin}/share/list",
-        params,
-        origin + "/",
-    )
-    errno = _errno(data)
-    if errno:
-        raise RuntimeError(
-            f"TeraBox share API error {errno}: "
-            f"{data.get('errmsg') or data.get('error') or 'unknown'}"
-        )
-
-    rows = _first_list(data)
-    return [_normalize(x) for x in rows if isinstance(x, dict)]
-
-
-async def _resolve_via_shorturlinfo(
-    session,
-    origin,
-    share_url,
-    surl,
-    js_token=None,
-    dp_logid="",
-):
-    """Resolve a share through TeraBox's public share-page token flow."""
-    if not js_token:
-        page_origin = origin
-        page_url, js_token, page_dp_logid = await _share_page_tokens(
-            session, share_url, surl, page_origin
-        )
-        dp_logid = dp_logid or page_dp_logid
+    if js_token:
+        log.warning("TeraBox jsToken extracted successfully")
     else:
-        page_url = share_url
+        log.warning("TeraBox jsToken not found in sharing/link HTML")
 
-    if not js_token:
-        raise RuntimeError("TeraBox share page did not expose jsToken.")
+    if share_id or uk:
+        log.warning("TeraBox yunData found: share_id=%s uk=%s", bool(share_id), bool(uk))
 
-    referer = page_url or f"{origin}/"
-    last = None
-
-    for shorturl in (f"1{surl}", surl):
-        params = {
-            "app_id": APP_ID,
-            "shorturl": shorturl,
-            "root": "1",
-            "jsToken": js_token,
-        }
-        if dp_logid:
-            params["dp-logid"] = dp_logid
-
-        try:
-            data = await _get_json(
-                session,
-                f"{origin}/api/shorturlinfo",
-                params,
-                referer,
-            )
-            errno = _errno(data)
-            if errno:
-                last = RuntimeError(
-                    f"TeraBox shorturlinfo error {errno}: "
-                    f"{data.get('errmsg') or data.get('show_msg') or 'unknown'}"
-                )
-                continue
-
-            rows = [
-                _normalize(x)
-                for x in _first_list(data)
-                if isinstance(x, dict)
-            ]
-            if not rows:
-                last = RuntimeError(
-                    "TeraBox shorturlinfo returned no files."
-                )
-                continue
-
-            meta = (
-                data.get("data")
-                if isinstance(data.get("data"), dict)
-                else data
-            )
-            share_id = str(
-                meta.get("shareid") or meta.get("share_id") or ""
-            )
-            uk = str(meta.get("uk") or "")
-            sign = str(meta.get("sign") or "")
-            timestamp = str(meta.get("timestamp") or "")
-
-            usable = [x for x in rows if x["direct_url"]]
-            if usable:
-                return usable[0], rows
-
-            row = next(
-                (
-                    x
-                    for x in rows
-                    if not x["is_dir"] and x["fs_id"]
-                ),
-                None,
-            )
-            if not row:
-                last = RuntimeError(
-                    "TeraBox metadata contains no downloadable file."
-                )
-                continue
-
-            if not (share_id and uk and sign and timestamp):
-                last = RuntimeError(
-                    "TeraBox metadata lacks shareid/uk/sign/timestamp "
-                    "for download."
-                )
-                continue
-
-            download_params = {
+    if not file_list or not any(str(x.get("dlink") or "").strip() for x in file_list):
+        for key in candidates:
+            endpoint = "https://www.terabox.app/share/list"
+            params = {
                 "app_id": APP_ID,
                 "web": "1",
                 "channel": "dubox",
                 "clienttype": "0",
-                "jsToken": js_token,
-                "shareid": share_id,
-                "sign": sign,
-                "timestamp": timestamp,
+                "root": "1",
+                "page": "1",
+                "num": "100",
+                "shorturl": key,
             }
-            if dp_logid:
-                download_params["dp-logid"] = dp_logid
+            if js_token:
+                params["jsToken"] = js_token
+            try:
+                async with session.get(
+                    endpoint,
+                    params=params,
+                    headers=_headers("https://www.terabox.app/", json_request=True, cookie=merged_cookie),
+                    allow_redirects=True,
+                ) as response:
+                    body = await response.text(errors="replace")
+                    if response.status >= 400:
+                        log.warning("TeraBox /share/list HTTP %s", response.status)
+                        continue
+                    data = json.loads(body)
+                    if (
+                        isinstance(data, dict)
+                        and int(data.get("errno") or -1) == 0
+                        and isinstance(data.get("list"), list)
+                        and data["list"]
+                    ):
+                        file_list = [x for x in data["list"] if isinstance(x, dict)]
+                        share_id = str(data.get("share_id") or share_id)
+                        uk = str(data.get("uk") or uk)
+                        log.warning("TeraBox /share/list returned %d items", len(file_list))
+                        break
+            except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError, ValueError) as exc:
+                log.warning("TeraBox /share/list failed for key=%s: %r", key, exc)
 
-            form = {
-                "product": "share",
-                "nozip": "0",
-                "fid_list": json.dumps([int(row["fs_id"])]),
-                "uk": uk,
-                "primaryid": share_id,
-            }
+    if not file_list:
+        raise RuntimeError("No files found in the TeraBox share response.")
 
-            async with session.post(
-                f"{origin}/share/download",
-                params=download_params,
-                data=form,
-                headers={
-                    **_headers(referer),
-                    "Content-Type": "application/x-www-form-urlencoded",
-                },
-                allow_redirects=False,
-            ) as response:
-                body = await response.text()
-                if response.status >= 400:
-                    raise RuntimeError(
-                        "TeraBox share/download HTTP "
-                        f"{response.status}: {body[:160]}"
-                    )
-                try:
-                    download_data = json.loads(body)
-                except json.JSONDecodeError as exc:
-                    raise RuntimeError(
-                        "TeraBox share/download returned non-JSON."
-                    ) from exc
-
-            errno = _errno(download_data)
-            if errno:
-                last = RuntimeError(
-                    f"TeraBox share/download error {errno}: "
-                    f"{download_data.get('errmsg') or download_data.get('show_msg') or 'unknown'}"
-                )
-                continue
-
-            dlink = str(
-                download_data.get("dlink") or ""
-            ).strip()
-            if not dlink and isinstance(
-                download_data.get("data"), dict
-            ):
-                dlink = str(
-                    download_data["data"].get("dlink") or ""
-                ).strip()
-
-            if dlink:
-                row["direct_url"] = dlink
-                return row, rows
-
-            last = RuntimeError(
-                "TeraBox share/download returned no dlink."
-            )
-        except (
-            aiohttp.ClientError,
-            asyncio.TimeoutError,
-            RuntimeError,
-        ) as exc:
-            last = exc
-            log.info(
-                "token flow failed via %s for shorturl=%s: %s",
-                origin,
-                shorturl,
-                exc,
-            )
-
-    raise last or RuntimeError(
-        "TeraBox shorturlinfo resolution failed."
-    )
-
-
-
-def _parse_gateway_size(value) -> int:
-    try:
-        if isinstance(value, (int, float)):
-            return int(value)
-        text = str(value or "").strip().upper().replace(",", "")
-        match = re.fullmatch(r"([0-9.]+)\\s*([KMGTP]?B)?", text)
-        if not match:
-            return 0
-        amount = float(match.group(1))
-        unit = match.group(2) or "B"
-        factors = {
-            "B": 1,
-            "KB": 1024,
-            "MB": 1024 ** 2,
-            "GB": 1024 ** 3,
-            "TB": 1024 ** 4,
-            "PB": 1024 ** 5,
-        }
-        return int(amount * factors.get(unit, 1))
-    except (TypeError, ValueError):
-        return 0
-
-
-async def _resolve_via_edge_gateway(session, share_url):
-    """Use a Cloudflare-edge resolver when TeraBox blocks Render's IP."""
-    endpoint = os.getenv(
-        "TERABOX_EDGE_RESOLVER_URL",
-        "https://terabox-worker.robinkumarshakya103.workers.dev/api",
-    ).strip()
-    if not endpoint:
-        raise RuntimeError("Edge resolver is disabled.")
-
-    async with session.get(
-        endpoint,
-        params={"url": share_url},
-        headers={
-            "User-Agent": UA,
-            "Accept": "application/json",
-        },
-        allow_redirects=True,
-    ) as response:
-        body = await response.text()
-        if response.status >= 400:
-            raise RuntimeError(
-                f"Edge resolver HTTP {response.status}: {body[:200]}"
-            )
-        try:
-            data = json.loads(body)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError("Edge resolver returned non-JSON.") from exc
-
-    if not isinstance(data, dict) or not data.get("success"):
-        raise RuntimeError(
-            "Edge resolver failed: "
-            f"{data.get('error') if isinstance(data, dict) else 'invalid response'}"
-        )
-
-    files = data.get("files")
-    if not isinstance(files, list) or not files:
-        raise RuntimeError("Edge resolver returned no files.")
-
-    normalized = []
-    for item in files:
-        if not isinstance(item, dict):
-            continue
-
-        file_name = str(
-            item.get("file_name")
-            or item.get("filename")
-            or item.get("name")
-            or ""
-        ).strip()
-
-        proxied = str(
-            item.get("download_url")
-            or item.get("original_download_url")
-            or ""
-        ).strip()
-        if not proxied:
-            continue
-
-        normalized.append(
-            {
-                "file_name": file_name,
-                "size": _parse_gateway_size(item.get("size")),
-                "fs_id": str(
-                    item.get("fid")
-                    or item.get("fs_id")
-                    or ""
-                ),
-                "path": str(item.get("path") or ""),
-                "is_dir": False,
-                "direct_url": proxied,
-                "thumbnail": str(
-                    item.get("thumbnail")
-                    or item.get("thumb")
-                    or ""
-                ),
-            }
-        )
-
-    if not normalized:
-        raise RuntimeError(
-            "Edge resolver returned no downloadable file URLs."
-        )
-
-    return normalized[0], normalized
-
-
-async def _origins(session, share_url):
-    out = []
-    parsed = urlparse(share_url)
-    if parsed.scheme and parsed.netloc:
-        out.append(f"{parsed.scheme}://{parsed.netloc}")
-
-    try:
-        async with session.get(
-            share_url,
-            headers=_headers(share_url, html=True),
-            allow_redirects=True,
-        ) as response:
-            final = response.url
-            if final.scheme and final.host:
-                out.insert(0, f"{final.scheme}://{final.host}")
-    except (aiohttp.ClientError, asyncio.TimeoutError):
-        pass
-
-    out += [
-        "https://www.terabox.com",
-        "https://www.1024terabox.com",
-        "https://www.terabox.app",
-        "https://www.1024tera.com",
+    rows = [
+        _normalize_file(item, full_url, share_id=share_id, uk=uk)
+        for item in file_list
     ]
-    return list(dict.fromkeys(out))
+
+    # Match the working implementation's download fallback. The dlink is
+    # short-lived, so generate it immediately after metadata extraction.
+    for row in rows:
+        if row["is_dir"] or row["direct_url"]:
+            continue
+        if not (js_token and share_id and uk and row["fs_id"]):
+            continue
+
+        params = {
+            "app_id": APP_ID,
+            "web": "1",
+            "channel": "dubox",
+            "clienttype": "0",
+            "jsToken": js_token,
+            "shareid": share_id,
+            "uk": uk,
+            "primaryid": share_id,
+            "product": "share",
+            "nozip": "0",
+            "fid_list": json.dumps([int(row["fs_id"])]),
+        }
+        try:
+            async with session.get(
+                "https://www.terabox.app/share/download",
+                params=params,
+                headers=_headers("https://www.terabox.app/", cookie=merged_cookie),
+                allow_redirects=True,
+            ) as response:
+                body = await response.text(errors="replace")
+                if response.status >= 400:
+                    log.warning("TeraBox /share/download HTTP %s", response.status)
+                    continue
+                data = json.loads(body)
+                if isinstance(data, dict) and int(data.get("errno") or -1) == 0:
+                    row["direct_url"] = str(data.get("dlink") or "").strip()
+                    if not row["direct_url"] and isinstance(data.get("data"), dict):
+                        row["direct_url"] = str(data["data"].get("dlink") or "").strip()
+        except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError, ValueError) as exc:
+            log.warning("TeraBox /share/download failed: %r", exc)
+
+    usable = [row for row in rows if not row["is_dir"] and row["direct_url"]]
+    if not usable:
+        raise RuntimeError(
+            "TeraBox metadata was found, but no downloadable dlink was returned."
+        )
+
+    return usable[0], rows
 
 
-def _result(surl, row, files):
+async def _resolve_bridge(
+    session: aiohttp.ClientSession,
+    clean_url: str,
+) -> tuple[dict, list[dict]]:
+    for template in BRIDGE_ENDPOINTS:
+        endpoint = template.format(url=quote(clean_url, safe=""))
+        try:
+            async with session.get(
+                endpoint,
+                headers=_headers("https://www.terabox.app/"),
+                allow_redirects=True,
+                timeout=aiohttp.ClientTimeout(total=10, connect=5),
+            ) as response:
+                if response.status >= 400:
+                    log.warning("Bridge HTTP %s: %s", response.status, urlparse(endpoint).netloc)
+                    continue
+                data = json.loads(await response.text(errors="replace"))
+        except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError) as exc:
+            log.warning("Bridge failed %s: %r", urlparse(endpoint).netloc, exc)
+            continue
+
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict) and isinstance(data.get("list"), list):
+            items = data["list"]
+        elif isinstance(data, dict) and isinstance(data.get("download_links"), list):
+            items = data["download_links"]
+        elif isinstance(data, dict) and any(
+            data.get(k) for k in ("download_url", "dlink", "downloadUrl", "direct_link", "url")
+        ):
+            items = [data]
+        else:
+            continue
+
+        rows: list[dict] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            direct = str(
+                item.get("download_url")
+                or item.get("dlink")
+                or item.get("downloadUrl")
+                or item.get("direct_link")
+                or item.get("url")
+                or item.get("download")
+                or ""
+            ).strip()
+            if not direct:
+                continue
+            rows.append(
+                {
+                    "file_name": str(
+                        item.get("file_name")
+                        or item.get("filename")
+                        or item.get("server_filename")
+                        or item.get("name")
+                        or "terabox_download"
+                    ).strip(),
+                    "size": _parse_int(item.get("size") or item.get("file_size")),
+                    "fs_id": str(item.get("fs_id") or item.get("fid") or ""),
+                    "path": str(item.get("path") or ""),
+                    "is_dir": False,
+                    "direct_url": direct,
+                    "thumbnail": str(item.get("thumbnail") or item.get("thumb") or ""),
+                    "share_id": "",
+                    "uk": "",
+                    "source_url": clean_url,
+                }
+            )
+
+        if rows:
+            log.warning("Bridge %s resolved %d file(s)", urlparse(endpoint).netloc, len(rows))
+            return rows[0], rows
+
+    raise RuntimeError("All external TeraBox bridge resolvers failed.")
+
+
+def _result(surl: str, row: dict, files: list[dict]) -> dict:
     return {
         "surl": surl,
         "file_name": row["file_name"],
@@ -745,190 +451,35 @@ def _result(surl, row, files):
     }
 
 
-async def resolve_terabox_url_browser_first(url: str) -> dict:
-    """Resolve a public share through fresh Playwright Chromium first."""
-    if not is_terabox_url(url):
-        raise ValueError("Unsupported TeraBox URL.")
-
-    surl = extract_surl(url)
-    connector = aiohttp.TCPConnector(resolver=aiohttp.ThreadedResolver())
-    async with aiohttp.ClientSession(
-        connector=connector,
-        timeout=aiohttp.ClientTimeout(total=30, connect=10),
-        cookie_jar=aiohttp.CookieJar(),
-    ) as session:
-        log.warning("Chromium-first resolver starting for surl=%s", surl)
-        row, browser_rows = await _resolve_via_browser(session, url, surl)
-        if not row.get("direct_url"):
-            raise RuntimeError("Chromium resolver returned a file without a direct URL.")
-        log.warning("Chromium-first resolver succeeded: file=%s", row.get("file_name"))
-        return _result(surl, row, browser_rows)
-
-
 async def resolve_terabox_url(url: str) -> dict:
     if not is_terabox_url(url):
         raise ValueError("Unsupported TeraBox URL.")
 
     surl = extract_surl(url)
-    connector = aiohttp.TCPConnector(
-        resolver=aiohttp.ThreadedResolver()
-    )
+    clean_url = f"https://terabox.com/s/{_candidate_keys(surl)[-1]}"
+    active_cookie = os.getenv("TERABOX_COOKIE", "").strip()
 
+    connector = aiohttp.TCPConnector(resolver=aiohttp.ThreadedResolver())
     async with aiohttp.ClientSession(
         connector=connector,
         timeout=TIMEOUT,
         cookie_jar=aiohttp.CookieJar(),
     ) as session:
-        last = None
-
-        for origin in await _origins(session, url):
-            try:
-                # Fetch the public share page first so every subsequent web
-                # API request has the current short-lived jsToken.
-                page_url, js_token, dp_logid = await _share_page_tokens(
-                    session, url, surl, origin
-                )
-                if not js_token:
-                    raise RuntimeError(
-                        f"No jsToken available from {urlparse(page_url).netloc}."
-                    )
-
-                page_origin = f"{urlparse(page_url).scheme}://{urlparse(page_url).netloc}"
-                if page_origin in origin:
-                    api_origin = origin
-                else:
-                    api_origin = page_origin
-
-                log.info(
-                    "Trying tokenized TeraBox resolver: origin=%s surl=%s",
-                    api_origin,
-                    surl,
-                )
-
-                try:
-                    rows = await _list_scope(
-                        session,
-                        api_origin,
-                        surl,
-                        js_token,
-                        dp_logid,
-                    )
-                    files = [
-                        x for x in rows
-                        if not x["is_dir"]
-                    ]
-
-                    for folder in [
-                        x for x in rows if x["is_dir"]
-                    ][:10]:
-                        try:
-                            child_rows = await _list_scope(
-                                session,
-                                api_origin,
-                                surl,
-                                js_token,
-                                dp_logid,
-                                folder["path"],
-                            )
-                            files.extend(
-                                x for x in child_rows
-                                if not x["is_dir"]
-                            )
-                        except (
-                            aiohttp.ClientError,
-                            asyncio.TimeoutError,
-                            RuntimeError,
-                        ) as exc:
-                            log.info(
-                                "folder listing failed for %s: %s",
-                                folder.get("path"),
-                                exc,
-                            )
-
-                    if files:
-                        usable = [
-                            x for x in files[:50]
-                            if x["direct_url"]
-                        ]
-                        if usable:
-                            log.info(
-                                "TeraBox /share/list returned dlink for %s",
-                                usable[0]["file_name"],
-                            )
-                            return _result(
-                                surl, usable[0], files
-                            )
-
-                except (
-                    aiohttp.ClientError,
-                    asyncio.TimeoutError,
-                    RuntimeError,
-                ) as exc:
-                    # Do not stop here. The shorturlinfo/share-download flow
-                    # can still resolve the file when /share/list is blocked.
-                    log.info(
-                        "tokenized /share/list failed via %s: %s; "
-                        "falling back to shorturlinfo",
-                        api_origin,
-                        exc,
-                    )
-
-                row, token_rows = await _resolve_via_shorturlinfo(
-                    session,
-                    api_origin,
-                    page_url,
-                    surl,
-                    js_token=js_token,
-                    dp_logid=dp_logid,
-                )
-                log.info(
-                    "TeraBox shorturlinfo/share-download resolved %s",
-                    row["file_name"],
-                )
-                return _result(
-                    surl,
-                    row,
-                    token_rows,
-                )
-
-            except (
-                aiohttp.ClientError,
-                asyncio.TimeoutError,
-                RuntimeError,
-            ) as exc:
-                last = exc
-                log.info(
-                    "TeraBox resolver failed via %s: %s",
-                    origin,
-                    exc,
-                )
-
-        # Last attempt: run the public share application in fresh,
-        # non-persistent Chromium state and reuse any token it exposes.
         try:
-            row, browser_rows = await _resolve_via_browser(
-                session, url, surl
-            )
-            log.info(
-                "TeraBox Chromium resolver returned %s",
-                row["file_name"],
-            )
-            return _result(
+            row, files = await _resolve_direct(
+                session,
                 surl,
-                row,
-                browser_rows,
+                url,
+                active_cookie,
             )
-        except (
-            aiohttp.ClientError,
-            asyncio.TimeoutError,
-            RuntimeError,
-        ) as exc:
-            last = exc
-            log.info(
-                "TeraBox Chromium resolver failed: %s",
-                exc,
-            )
+            return _result(surl, row, files)
+        except Exception as direct_exc:
+            log.warning("Working direct TeraBox resolver failed: %r", direct_exc)
 
-        raise RuntimeError(
-            f"Direct TeraBox resolution failed. Last error: {last}"
-        )
+        try:
+            row, files = await _resolve_bridge(session, clean_url)
+            return _result(surl, row, files)
+        except Exception as bridge_exc:
+            raise RuntimeError(
+                f"TeraBox resolution failed. Direct: {direct_exc}; Bridge: {bridge_exc}"
+            ) from bridge_exc
