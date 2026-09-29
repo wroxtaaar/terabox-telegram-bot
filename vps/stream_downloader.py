@@ -82,6 +82,7 @@ async def download_m3u8_stream(
     sign: str = "",
     timestamp: str = "",
     fs_id: str = "",
+    randsk: str = "",
     progress: ProgressCallback | None = None,
 ) -> tuple[int, int]:
     """
@@ -104,8 +105,13 @@ async def download_m3u8_stream(
         "Referer": referer_url or "https://www.terabox.app/",
         "Accept": "*/*",
     }
-    if cookie_header:
-        headers["Cookie"] = cookie_header
+    effective_cookie = cookie_header.strip()
+    if randsk and "TSID=" not in effective_cookie:
+        effective_cookie = (
+            f"{effective_cookie}; TSID={randsk}" if effective_cookie else f"TSID={randsk}"
+        )
+    if effective_cookie:
+        headers["Cookie"] = effective_cookie
 
     timeout = aiohttp.ClientTimeout(
         total=None,
