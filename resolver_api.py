@@ -6,7 +6,7 @@ import traceback
 
 from fastapi import FastAPI, Header, HTTPException, Query
 
-from app.terabox import resolve_terabox_url_browser_first
+from app.terabox import resolve_terabox_url
 
 app = FastAPI(title="TeraBox Resolver")
 
@@ -33,7 +33,7 @@ async def resolve(
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     try:
-        result = await resolve_terabox_url_browser_first(url)
+        result = await resolve_terabox_url(url)
         return {
             "success": True,
             "surl": result.get("surl"),
