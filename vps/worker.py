@@ -228,7 +228,7 @@ class Worker:
         if not self.bot_token or not self.api_id or not self.api_hash:
             raise RuntimeError("BOT_TOKEN, API_ID and API_HASH are required.")
 
-        for directory in (DATA_DIR, DOWNLOADS_DIR, UNPACKED_DIR):
+        for directory in (DATA_DIR, DOWNLOADS_DIR, UNPACKED_DIR, DOWNLOADS_DIR / "active"):
             directory.mkdir(parents=True, exist_ok=True)
 
         self.session_dir = Path(os.getenv("TELETHON_SESSION_DIR", "/worker/data"))
@@ -772,7 +772,7 @@ class Worker:
                 self.inspecting_task = task
                 try:
                     log.info("task=%s inspecting TeraBox metadata", task.task_id)
-                    metadata = await self.resolver.resolve(task.url)
+                    metadata = await self.resolver.resolve(task.url, allow_native_download=False)
                     files = [
                         item for item in (metadata.get("files") or [])
                         if isinstance(item, dict) and not item.get("is_dir")
@@ -876,7 +876,9 @@ class Worker:
         )
 
         try:
-            resolved = await self.resolver.resolve(task.url)
+            job["status"] = "resolving"
+            self._save_jobs()
+            resolved = await self.resolver.resolve(task.url, allow_native_download=True)
             files = [
                 item for item in (resolved.get("files") or [])
                 if isinstance(item, dict) and not item.get("is_dir")
@@ -942,6 +944,7 @@ class Worker:
                         f"{original_name} exceeds MAX_SOURCE_FILE_SIZE_BYTES."
                     )
 
+                job["status"] = "downloading"
                 await self._status(
                     job,
                     task,
@@ -964,7 +967,9 @@ class Worker:
                     ):
                         path = Path(browser_download_path)
                         if path.exists():
-                            downloaded_path = path
+                            target = job_dir / f"{index}_{safe_filename(candidate_name)}"
+                            shutil.move(str(path), str(target))
+                            downloaded_path = target
                             browser_download_used = True
 
                     if downloaded_path is None and source.get("direct_url"):
