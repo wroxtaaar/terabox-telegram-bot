@@ -420,6 +420,21 @@ class TeraBoxBrowserResolver:
                 sign = sign or api_meta.get("sign", "")
                 timestamp = timestamp or api_meta.get("timestamp", "")
 
+                # The page's own JavaScript may call share/list with extra
+                # challenge parameters (pcftoken, psign, clientfrom, etc.).
+                # Give those response listeners time to finish and prefer the
+                # successful captured response over a simplified API call.
+                await page.wait_for_timeout(500)
+                captured_rows, captured_meta = self._extract_api_payloads(
+                    response_payloads
+                )
+                if captured_rows:
+                    file_rows = captured_rows
+                share_id = share_id or captured_meta.get("shareid", "")
+                uk = uk or captured_meta.get("uk", "")
+                sign = sign or captured_meta.get("sign", "")
+                timestamp = timestamp or captured_meta.get("timestamp", "")
+
                 if not file_rows:
                     api_rows, api_meta = await self._browser_shorturlinfo(
                         page, surl, js_token, dp_logid
@@ -430,15 +445,12 @@ class TeraBoxBrowserResolver:
                     sign = sign or api_meta.get("sign", "")
                     timestamp = timestamp or api_meta.get("timestamp", "")
 
-                if not file_rows:
-                    captured_rows, captured_meta = self._extract_api_payloads(
-                        response_payloads
-                    )
-                    file_rows = captured_rows
-                    share_id = share_id or captured_meta.get("shareid", "")
-                    uk = uk or captured_meta.get("uk", "")
-                    sign = sign or captured_meta.get("sign", "")
-                    timestamp = timestamp or captured_meta.get("timestamp", "")
+            log.info(
+                "TeraBox API metadata: files=%s share_id=%s uk=%s",
+                len(file_rows),
+                bool(share_id),
+                bool(uk),
+            )
 
             direct = next(
                 (row for row in file_rows if row.get("direct_url")),
@@ -477,11 +489,24 @@ class TeraBoxBrowserResolver:
                     })
                     """
                 )
+                def _safe_url(value: str) -> str:
+                    try:
+                        parsed = urlparse(value)
+                        return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+                    except Exception:
+                        return value.split("?", 1)[0]
+
                 log_line = {
-                    "responses": responses[-20:],
+                    "responses": [
+                        {
+                            **item,
+                            "url": _safe_url(str(item.get("url") or "")),
+                        }
+                        for item in responses[-20:]
+                    ],
                     "captured_payloads": [
                         {
-                            "url": item.get("url"),
+                            "url": _safe_url(str(item.get("url") or "")),
                             "status": item.get("status"),
                             "content_type": item.get("content_type"),
                             "body": item.get("body", "")[:2000],
@@ -722,96 +747,157 @@ class TeraBoxBrowserResolver:
         timestamp: str,
         fs_id: str,
     ) -> str:
-        if not all((js_token, share_id, uk, sign, timestamp, fs_id)):
+        if not all((js_token, share_id, uk, fs_id)):
             return ""
 
-        query = {
+        fid_json = json.dumps([int(fs_id)])
+        base_params = {
             "app_id": APP_ID,
             "web": "1",
             "channel": "dubox",
             "clienttype": "0",
             "jsToken": js_token,
             "shareid": share_id,
-            "sign": sign,
-            "timestamp": timestamp,
+            "uk": uk,
+            "primaryid": share_id,
+            "product": "share",
+            "nozip": "0",
+            "fid_list": fid_json,
         }
 
-        # Try the form POST first.
+        # This mirrors the working TeraBox implementation: use the browser's
+        # live session and the GET form of /share/download.
         result = await page.evaluate(
             """
-            async ({query, form}) => {
+            async ({params}) => {
               const u = new URL('/share/download', location.origin);
-              for (const [key, value] of Object.entries(query))
+              for (const [key, value] of Object.entries(params))
                 u.searchParams.set(key, value);
 
-              const body = new URLSearchParams(form);
               const response = await fetch(u.toString(), {
-                method: 'POST',
+                method: 'GET',
                 credentials: 'include',
                 headers: {
                   'Accept': 'application/json, text/plain, */*',
                   'X-Requested-With': 'XMLHttpRequest',
-                  'Content-Type': 'application/x-www-form-urlencoded'
-                },
-                body
+                  'Referer': 'https://www.terabox.app/'
+                }
               });
+
               const text = await response.text();
               let data = null;
               try { data = JSON.parse(text); } catch (_) {}
-              return {status: response.status, data};
+
+              return {
+                status: response.status,
+                data,
+                text: text.slice(0, 4000)
+              };
             }
             """,
-            {
-                "query": query,
-                "form": {
-                    "product": "share",
-                    "nozip": "0",
-                    "fid_list": json.dumps([int(fs_id)]),
-                    "uk": uk,
-                    "primaryid": share_id,
-                },
-            },
+            {"params": base_params},
         )
 
-        dlink = self._extract_dlink(result.get("data") if isinstance(result, dict) else None)
+        print(
+            f"share/download status={result.get('status')} "
+            f"data={'yes' if isinstance(result.get('data'), dict) else 'no'}",
+            flush=True,
+        )
+
+        dlink = self._extract_dlink(
+            result.get("data") if isinstance(result, dict) else None
+        )
         if dlink:
             return dlink
 
-        # Some TeraBox deployments expose the same operation as GET.
-        result = await page.evaluate(
+        # Some TeraBox variants reject the first request unless the web
+        # client parameters seen in the original share/list request are also
+        # present. Search the page's performance entries for those parameters
+        # and retry within the same browser session.
+        extra = await page.evaluate(
             """
-            async ({query, fid, uk, shareId}) => {
-              const u = new URL('/share/download', location.origin);
-              for (const [key, value] of Object.entries(query))
-                u.searchParams.set(key, value);
-              u.searchParams.set('fid_list', JSON.stringify([Number(fid)]));
-              u.searchParams.set('uk', uk);
-              u.searchParams.set('primaryid', shareId);
-
-              const response = await fetch(u.toString(), {
-                credentials: 'include',
-                headers: {
-                  'Accept': 'application/json, text/plain, */*',
-                  'X-Requested-With': 'XMLHttpRequest'
-                }
-              });
-              const text = await response.text();
-              let data = null;
-              try { data = JSON.parse(text); } catch (_) {}
-              return {status: response.status, data};
+            () => {
+              const urls = performance.getEntriesByType('resource')
+                .map(x => x.name)
+                .filter(x => /\\/share\\/list\\?/i.test(x));
+              return urls.length ? urls[urls.length - 1] : '';
             }
-            """,
-            {
-                "query": query,
-                "fid": fs_id,
-                "uk": uk,
-                "shareId": share_id,
-            },
+            """
         )
 
-        return self._extract_dlink(
-            result.get("data") if isinstance(result, dict) else None
+        if extra:
+            result = await page.evaluate(
+                """
+                async ({sourceUrl, shareId, uk, fid}) => {
+                  const source = new URL(sourceUrl);
+                  const u = new URL('/share/download', location.origin);
+
+                  for (const [key, value] of source.searchParams.entries()) {
+                    if (key !== 'shorturl' && key !== 'page' && key !== 'num') {
+                      u.searchParams.set(key, value);
+                    }
+                  }
+
+                  u.searchParams.set('app_id', '250528');
+                  u.searchParams.set('shareid', shareId);
+                  u.searchParams.set('uk', uk);
+                  u.searchParams.set('primaryid', shareId);
+                  u.searchParams.set('product', 'share');
+                  u.searchParams.set('nozip', '0');
+                  u.searchParams.set('fid_list', JSON.stringify([Number(fid)]));
+
+                  const response = await fetch(u.toString(), {
+                    credentials: 'include',
+                    headers: {
+                      'Accept': 'application/json, text/plain, */*',
+                      'X-Requested-With': 'XMLHttpRequest',
+                      'Referer': 'https://www.terabox.app/'
+                    }
+                  });
+
+                  const text = await response.text();
+                  let data = null;
+                  try { data = JSON.parse(text); } catch (_) {}
+
+                  return {
+                    status: response.status,
+                    data,
+                    text: text.slice(0, 4000)
+                  };
+                }
+                """,
+                {
+                    "sourceUrl": extra,
+                    "shareId": share_id,
+                    "uk": uk,
+                    "fid": fs_id,
+                },
+            )
+
+            print(
+                f"share/download replay status={result.get('status')} "
+                f"data={'yes' if isinstance(result.get('data'), dict) else 'no'}",
+                flush=True,
+            )
+
+            dlink = self._extract_dlink(
+                result.get("data") if isinstance(result, dict) else None
+            )
+            if dlink:
+                return dlink
+
+        diagnostic = {
+            "status": result.get("status") if isinstance(result, dict) else None,
+            "text": result.get("text", "")[:1200] if isinstance(result, dict) else "",
+            "has_sign": bool(sign),
+            "has_timestamp": bool(timestamp),
+        }
+        print(
+            "share/download diagnostics="
+            + json.dumps(diagnostic, ensure_ascii=False)[:2500],
+            flush=True,
         )
+        return ""
 
     @staticmethod
     def _extract_dlink(data: Any) -> str:
