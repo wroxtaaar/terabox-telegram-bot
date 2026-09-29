@@ -755,33 +755,9 @@ async def resolve_terabox_url(url: str) -> dict:
                     exc,
                 )
 
-        # Render's datacenter IP can be challenged by TeraBox before
-        # the browser token is exposed. Try a separate edge resolver as the
-        # final fallback so the Telegram bot itself remains lightweight.
-        try:
-            row, gateway_rows = await _resolve_via_edge_gateway(
-                session, url
-            )
-            log.info(
-                "TeraBox edge gateway resolved %s",
-                row["file_name"],
-            )
-            return _result(
-                surl,
-                row,
-                gateway_rows,
-            )
-        except (
-            aiohttp.ClientError,
-            asyncio.TimeoutError,
-            RuntimeError,
-        ) as exc:
-            last = exc
-            log.info(
-                "TeraBox edge gateway failed: %s",
-                exc,
-            )
-
+        # This service is deliberately the independent direct resolver.
+        # Do not call the old Cloudflare gateway here; doing so would hide the
+        # real TeraBox response we are trying to diagnose.
         raise RuntimeError(
-            f"Could not read the TeraBox share. Last error: {last}"
+            f"Direct TeraBox resolution failed. Last error: {last}"
         )
