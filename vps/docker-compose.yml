@@ -1,0 +1,13 @@
+services:
+  terabox-worker:
+    build: .
+    container_name: terabox-vps-worker
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "18080:18080"
+    shm_size: "1gb"
+    init: true
+    security_opt:
+      - no-new-privileges:true
