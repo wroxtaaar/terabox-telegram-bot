@@ -840,6 +840,7 @@ class TeraBoxBrowserResolver:
                 "timestamp": str(
                     meta.get("timestamp") or meta.get("TIMESTAMP") or ""
                 ),
+                "randsk": str(meta.get("randsk") or meta.get("RANDSK") or ""),
             }
 
         return [], {}
