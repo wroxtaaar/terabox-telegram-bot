@@ -15,7 +15,7 @@ ProgressCallback = Callable[[int, int, int], Awaitable[None] | None]
 
 def _chunk_url_with_full_range(segment_url: str) -> tuple[int, str, int]:
     parsed = urlparse(segment_url)
-    match = re.search(r"_(\d+)_ts\b", segment_url, re.IGNORECASE)
+    match = re.search(r"_(\d+)_ts\b", parsed.path, re.IGNORECASE)
     chunk_index = int(match.group(1)) if match else 0
 
     params = dict(parse_qsl(parsed.query, keep_blank_values=True))
@@ -105,13 +105,8 @@ async def download_m3u8_stream(
         "Referer": referer_url or "https://www.terabox.app/",
         "Accept": "*/*",
     }
-    effective_cookie = cookie_header.strip()
-    if randsk and "TSID=" not in effective_cookie:
-        effective_cookie = (
-            f"{effective_cookie}; TSID={randsk}" if effective_cookie else f"TSID={randsk}"
-        )
-    if effective_cookie:
-        headers["Cookie"] = effective_cookie
+    if cookie_header:
+        headers["Cookie"] = cookie_header
 
     timeout = aiohttp.ClientTimeout(
         total=None,
@@ -137,104 +132,59 @@ async def download_m3u8_stream(
 
         if effective_share_id and effective_uk and effective_fid and effective_sign and effective_timestamp:
             try:
-                # The streaming endpoint can return one randomly selected
-                # transport-stream chunk per request. Do not assume that
-                # time=25,50,... selects a deterministic timeline window.
-                duration_seconds = int(duration) if duration else 0
+                max_scan_time = max(30, int(duration) + 30) if duration else 7200
             except (TypeError, ValueError):
-                duration_seconds = 0
+                max_scan_time = 7200
 
-            estimated_chunks = max(1, (duration_seconds + 239) // 240) if duration_seconds else 1
-            request_budget = min(100, max(30, estimated_chunks * 3))
-            no_new_streak = 0
+            step = 25
+            empty_streak = 0
 
-            base_query = dict(parse_qsl(parsed.query, keep_blank_values=True))
-            base_query.setdefault("app_id", "250528")
-            base_query.setdefault("web", "1")
-            base_query.setdefault("channel", "dubox")
-            base_query.setdefault("clienttype", "0")
-            base_query.setdefault("shareid", effective_share_id)
-            base_query.setdefault("uk", effective_uk)
-            base_query.setdefault("fid", effective_fid)
-            base_query.setdefault("sign", effective_sign)
-            base_query.setdefault("timestamp", effective_timestamp)
-            base_query.setdefault("type", "M3U8_AUTO_480")
-            base_query.setdefault("start", "0")
-            base_query.setdefault("esl", "1")
-            base_query.setdefault("isplayer", "1")
-            base_query.setdefault("ehps", "1")
-
-            for attempt in range(1, request_budget + 1):
-                poll_query = dict(base_query)
-                poll_query["start"] = "0"
-                poll_url = "https://www.terabox.app/share/streaming?" + urlencode(poll_query)
+            for t in range(step, max_scan_time + 1, step):
+                time_query = {
+                    "app_id": "250528",
+                    "web": "1",
+                    "channel": "dubox",
+                    "clienttype": "0",
+                    "shareid": effective_share_id,
+                    "uk": effective_uk,
+                    "fid": effective_fid,
+                    "sign": effective_sign,
+                    "timestamp": effective_timestamp,
+                    "type": "M3U8_AUTO_480",
+                    "time": str(t),
+                    "esl": "1",
+                    "isplayer": "1",
+                    "ehps": "1",
+                }
+                time_url = "https://www.terabox.app/share/streaming?" + urlencode(time_query)
 
                 try:
-                    poll_status, poll_playlist = await _fetch_text(
+                    time_status, time_playlist = await _fetch_text(
                         session,
-                        poll_url,
+                        time_url,
                         headers,
                     )
-                    if poll_status < 200 or poll_status >= 300:
-                        no_new_streak += 1
+                    if time_status < 200 or time_status >= 300:
                         continue
 
                     before = len(discovered)
-                    discovered.update(_parse_segments(poll_playlist, poll_url))
-                    added = len(discovered) - before
+                    discovered.update(_parse_segments(time_playlist, time_url))
 
-                    if added:
-                        no_new_streak = 0
-                        log.debug(
-                            "HLS poll %s/%s added=%s total=%s",
-                            attempt,
-                            request_budget,
-                            added,
-                            len(discovered),
-                        )
+                    if len(discovered) > before:
+                        empty_streak = 0
                     else:
-                        no_new_streak += 1
-
-                    # Once we have a contiguous set beginning at zero/one and
-                    # have seen several consecutive responses with no new
-                    # indices, further polling is unlikely to add anything.
-                    if discovered:
-                        indices_now = sorted(discovered)
-                        first_index = indices_now[0]
-                        contiguous = all(
-                            b == a + 1 for a, b in zip(indices_now, indices_now[1:])
-                        )
-                        if first_index <= 1 and contiguous:
-                            expected = estimated_chunks
-                            if len(indices_now) >= expected and no_new_streak >= 5:
-                                break
-                            if not duration_seconds and no_new_streak >= 10:
-                                break
-                except Exception as exc:
-                    no_new_streak += 1
-                    if no_new_streak <= 2:
-                        log.debug("HLS poll %s failed: %s", attempt, exc)
-
+                        empty_streak += 1
+                        if not duration and empty_streak >= 4 and discovered:
+                            break
+                except Exception:
+                    continue
 
         indices = sorted(discovered)
         if not indices:
             raise RuntimeError("M3U8 playlist contained no video segments.")
 
         temp_ts = output_path.with_suffix(output_path.suffix + ".temp.ts")
-        # Keep a real container extension so FFmpeg can infer the output
-        # format. A name ending only in ".tmp" makes FFmpeg report
-        # "Unable to find a suitable output format".
-        temp_output = output_path.with_name(
-            f"{output_path.stem}.remux{output_path.suffix or '.mp4'}"
-        )
         total_bytes = 0
-
-        log = __import__("logging").getLogger("terabox-vps-worker")
-        log.info(
-            "HLS playlist discovered %s unique segment(s) for %s",
-            len(indices),
-            output_path.name,
-        )
 
         try:
             with temp_ts.open("wb") as output:
@@ -268,7 +218,9 @@ async def download_m3u8_stream(
                 os.getenv("FFMPEG_PATH", "").strip()
                 or "ffmpeg"
             )
-            temp_output.unlink(missing_ok=True)
+            temp_output = output_path.with_name(
+                f"{output_path.stem}.remux{output_path.suffix or '.mp4'}"
+            )
             process = await asyncio.create_subprocess_exec(
                 ffmpeg,
                 "-hide_banner",
