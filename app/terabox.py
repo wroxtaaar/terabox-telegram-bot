@@ -745,6 +745,26 @@ def _result(surl, row, files):
     }
 
 
+async def resolve_terabox_url_browser_first(url: str) -> dict:
+    """Resolve a public share through fresh Playwright Chromium first."""
+    if not is_terabox_url(url):
+        raise ValueError("Unsupported TeraBox URL.")
+
+    surl = extract_surl(url)
+    connector = aiohttp.TCPConnector(resolver=aiohttp.ThreadedResolver())
+    async with aiohttp.ClientSession(
+        connector=connector,
+        timeout=aiohttp.ClientTimeout(total=30, connect=10),
+        cookie_jar=aiohttp.CookieJar(),
+    ) as session:
+        log.warning("Chromium-first resolver starting for surl=%s", surl)
+        row, browser_rows = await _resolve_via_browser(session, url, surl)
+        if not row.get("direct_url"):
+            raise RuntimeError("Chromium resolver returned a file without a direct URL.")
+        log.warning("Chromium-first resolver succeeded: file=%s", row.get("file_name"))
+        return _result(surl, row, browser_rows)
+
+
 async def resolve_terabox_url(url: str) -> dict:
     if not is_terabox_url(url):
         raise ValueError("Unsupported TeraBox URL.")
