@@ -189,7 +189,12 @@ async def download_m3u8_stream(
             raise RuntimeError("M3U8 playlist contained no video segments.")
 
         temp_ts = output_path.with_suffix(output_path.suffix + ".temp.ts")
-        temp_output = output_path.with_suffix(output_path.suffix + ".remux.tmp")
+        # Keep a real container extension so FFmpeg can infer the output
+        # format. A name ending only in ".tmp" makes FFmpeg report
+        # "Unable to find a suitable output format".
+        temp_output = output_path.with_name(
+            f"{output_path.stem}.remux{output_path.suffix or '.mp4'}"
+        )
         total_bytes = 0
 
         log = __import__("logging").getLogger("terabox-vps-worker")
@@ -242,6 +247,8 @@ async def download_m3u8_stream(
                 str(temp_ts),
                 "-c",
                 "copy",
+                "-movflags",
+                "+faststart",
                 str(temp_output),
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
