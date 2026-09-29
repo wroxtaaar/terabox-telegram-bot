@@ -1,0 +1,48 @@
+name: Deploy Oracle VPS
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: oracle-vps-deploy
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Deploy to Oracle VPS
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy latest main to Oracle
+        uses: appleboy/ssh-action@v1.2.2
+        with:
+          host: ${{ secrets.ORACLE_HOST }}
+          username: ${{ secrets.ORACLE_USER }}
+          key: ${{ secrets.ORACLE_SSH_KEY }}
+          command_timeout: 30m
+          script: |
+            set -e
+
+            APP_DIR="${HOME}/terabox-telegram-bot"
+
+            if [ ! -d "${APP_DIR}/.git" ]; then
+              echo "Repository is missing at ${APP_DIR}"
+              exit 1
+            fi
+
+            cd "${APP_DIR}"
+
+            echo "Updating repository..."
+            git fetch origin main
+            git reset --hard origin/main
+
+            echo "Rebuilding and restarting Oracle worker..."
+            docker compose -f vps/docker-compose.yml up -d --build --remove-orphans
+
+            echo "Checking container status..."
+            docker compose -f vps/docker-compose.yml ps
+
+            echo "Deployment complete."
