@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hmac
 import os
+import traceback
 
 from fastapi import FastAPI, Header, HTTPException, Query
 
@@ -44,7 +45,12 @@ async def resolve(
             "thumbnail": result.get("thumbnail", ""),
         }
     except Exception as exc:
+        # Keep the public response useful for diagnosis without exposing
+        # cookies, headers, or browser state.
         return {
             "success": False,
             "error": str(exc),
+            "error_type": type(exc).__name__,
+            "error_repr": repr(exc),
+            "trace_tail": traceback.format_exc().splitlines()[-6:],
         }
