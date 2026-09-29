@@ -32,6 +32,11 @@ TERABOX_HOSTS = {
 
 APP_ID = "250528"
 
+STREAM_VIDEO_EXTENSIONS = {
+    ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v",
+    ".mpeg", ".mpg", ".3gp", ".ts", ".flv",
+}
+
 
 def is_terabox_url(value: str) -> bool:
     try:
@@ -446,6 +451,11 @@ class TeraBoxBrowserResolver:
                     or meta.get("timestamp")
                     or ""
                 )
+                randsk = str(
+                    meta.get("RANDSK")
+                    or meta.get("randsk")
+                    or ""
+                )
 
                 raw_files = (
                     yun_data.get("FILE_LIST")
@@ -536,6 +546,10 @@ class TeraBoxBrowserResolver:
             if not direct and share_id and uk:
                 for row in file_rows:
                     if row.get("is_dir") or not row.get("fs_id"):
+                        continue
+
+                    file_name = str(row.get("file_name") or "").lower()
+                    if not any(file_name.endswith(ext) for ext in STREAM_VIDEO_EXTENSIONS):
                         continue
 
                     row_sign = row.get("sign") or sign
