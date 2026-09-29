@@ -2,30 +2,37 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import re
+import shutil
 import tempfile
 import time
 import uuid
-from dataclasses import dataclass
+import zipfile
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
 import aiohttp
 from fastapi import FastAPI
-from telethon import TelegramClient, events
+from telethon import Button, TelegramClient, events
 from telethon.errors import FloodWaitError
 from telethon.sessions import SQLiteSession
 
 from .browser_resolver import TeraBoxBrowserResolver
+from .splitter import MAX_TELEGRAM_FILE_SIZE, split_binary_file, split_video
 from .stream_downloader import download_m3u8_stream
+
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 log = logging.getLogger("terabox-vps-worker")
+
 
 TERABOX_HOSTS = {
     "terabox.com",
@@ -48,13 +55,166 @@ TERABOX_HOSTS = {
     "www.terafileshare.com",
     "teraboxshare.com",
     "www.teraboxshare.com",
+    "nephobox.com",
+    "www.nephobox.com",
+    "mirrobox.com",
+    "www.mirrobox.com",
+    "mirrorbox.com",
+    "www.mirrorbox.com",
+    "momerybox.com",
+    "www.momerybox.com",
+    "tibibox.com",
+    "www.tibibox.com",
+    "gibibox.com",
+    "www.gibibox.com",
+    "pebibox.com",
+    "www.pebibox.com",
+    "4funbox.com",
+    "www.4funbox.com",
+    "dubox.com",
+    "www.dubox.com",
 }
 
+VIDEO_EXTENSIONS = {
+    ".mp4",
+    ".mkv",
+    ".webm",
+    ".mov",
+    ".avi",
+    ".m4v",
+    ".mpeg",
+    ".mpg",
+    ".3gp",
+    ".ts",
+    ".flv",
+}
+
+MAX_QUEUE_SIZE = int(os.getenv("MAX_QUEUE_SIZE", "100"))
+MAX_FILES_PER_LINK = int(os.getenv("MAX_FILES_PER_LINK", "25"))
+MAX_SOURCE_FILE_SIZE_BYTES = int(
+    os.getenv("MAX_SOURCE_FILE_SIZE_BYTES", str(2 * 1024 * 1024 * 1024))
+)
+MAX_DOWNLOAD_BYTES = int(
+    os.getenv("MAX_DOWNLOAD_BYTES", str(10 * 1024 * 1024 * 1024))
+)
+MAX_ZIP_SIZE_BYTES = int(
+    os.getenv("MAX_ZIP_SIZE_BYTES", str(250 * 1024 * 1024))
+)
+MAX_MT_PROTO_FILE_SIZE = int(
+    os.getenv("MAX_MT_PROTO_FILE_SIZE", str(2 * 1024 * 1024 * 1024))
+)
+
+DATA_DIR = Path(os.getenv("DATA_DIR", "/worker/data"))
+DOWNLOADS_DIR = Path(os.getenv("DOWNLOADS_DIR", "/tmp/terabox-downloads"))
+UNPACKED_DIR = Path(os.getenv("UNPACKED_DIR", "/tmp/terabox-unpacked"))
+JOBS_FILE = DATA_DIR / "jobs.json"
+
+
 @dataclass(slots=True)
-class Job:
-    job_id: str
+class QueueTask:
+    task_id: str
     chat_id: int
     url: str
+    file_names: list[str] | None = None
+    size_bytes: int | None = None
+    size_is_estimated: bool = False
+    cancel_requested: bool = False
+    retry_count: int = 0
+    queued_at: float = field(default_factory=time.time)
+    job_id: str | None = None
+
+
+def format_bytes(value: int | float) -> str:
+    value = float(value or 0)
+    if value <= 0:
+        return "0 B"
+    units = ("B", "KB", "MB", "GB", "TB")
+    index = min(len(units) - 1, int(value.bit_length() / 10) if value >= 1024 else 0)
+    return f"{value / (1024 ** index):.2f}".rstrip("0").rstrip(".") + f" {units[index]}"
+
+
+def safe_filename(value: str) -> str:
+    value = str(value or "").replace("\\", "/")
+    value = Path(value).name.strip()
+    value = re.sub(r"[<>:\"/|?*\x00-\x1f]", "_", value)
+    value = value.strip(" .")
+    return value[:240] or "terabox-file"
+
+
+def extract_url_from_text(text: str) -> str | None:
+    direct = re.search(r"https?://\S+", text or "", re.IGNORECASE)
+    if direct:
+        return direct.group(0).rstrip(").,]>")
+    bare = re.search(r"(?:www\.)?[A-Za-z0-9.-]+\.[A-Za-z]{2,}/\S+", text or "")
+    if bare:
+        return "https://" + bare.group(0).rstrip(").,]>")
+    return None
+
+
+def is_terabox_url(value: str) -> bool:
+    try:
+        host = (urlparse(value.strip()).hostname or "").lower()
+    except ValueError:
+        return False
+    return (
+        host in TERABOX_HOSTS
+        or host.endswith(".terabox.com")
+        or any(
+            host == item or host.endswith("." + item)
+            for item in ("terashare.com", "dubox.com", "nephobox.com")
+        )
+    )
+
+
+def normalize_link(raw_link: str) -> str:
+    extracted = extract_url_from_text((raw_link or "").strip()) or (raw_link or "").strip()
+    if not extracted:
+        return ""
+    try:
+        parsed = urlparse(extracted)
+        return parsed._replace(fragment="").geturl().rstrip("/")
+    except Exception:
+        return re.sub(r"\s+", "", extracted).rstrip("/")
+
+
+def get_directory_size(directory: Path) -> int:
+    if not directory.exists():
+        return 0
+    total = 0
+    for entry in directory.rglob("*"):
+        try:
+            if entry.is_file():
+                total += entry.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def detect_extension_from_buffer(header: bytes) -> str | None:
+    if len(header) >= 12 and header[4:8] == b"ftyp":
+        return ".mp4"
+    if len(header) >= 4 and header[:4] == bytes.fromhex("1a45dfa3"):
+        return ".mkv"
+    if len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"AVI ":
+        return ".avi"
+    if header[:3] == b"ID3" or (
+        len(header) >= 2 and header[0] == 0xFF and header[1] in (0xFB, 0xF3, 0xF2)
+    ):
+        return ".mp3"
+    if header[:4] == bytes.fromhex("504b0304"):
+        return ".zip"
+    if header[:6] == b"Rar!\x1a\x07":
+        return ".rar"
+    if header[:6] == bytes.fromhex("377abcaf271c"):
+        return ".7z"
+    if header[:4] == b"%PDF":
+        return ".pdf"
+    if header[:3] == bytes.fromhex("ffd8ff"):
+        return ".jpg"
+    if header[:4] == bytes.fromhex("89504e47"):
+        return ".png"
+    return None
+
 
 class Worker:
     def __init__(self):
@@ -64,23 +224,15 @@ class Worker:
         except ValueError as exc:
             raise RuntimeError("API_ID must be numeric.") from exc
         self.api_hash = os.getenv("API_HASH", "").strip()
-        self.max_download_bytes = int(
-            os.getenv("MAX_DOWNLOAD_BYTES", str(10 * 1024 * 1024 * 1024))
-        )
 
         if not self.bot_token or not self.api_id or not self.api_hash:
             raise RuntimeError("BOT_TOKEN, API_ID and API_HASH are required.")
 
-        self.queue: asyncio.Queue[Job] = asyncio.Queue()
-        self.resolver = TeraBoxBrowserResolver(max_concurrent=1)
+        for directory in (DATA_DIR, DOWNLOADS_DIR, UNPACKED_DIR):
+            directory.mkdir(parents=True, exist_ok=True)
 
-        # Persist MTProto authorization across Docker container restarts.
         self.session_dir = Path(os.getenv("TELETHON_SESSION_DIR", "/worker/data"))
         self.session_dir.mkdir(parents=True, exist_ok=True)
-
-        # Give each bot token its own persistent MTProto session. This is
-        # important when BOT_TOKEN is rotated: a new token must not reuse the
-        # old bot's authorized SQLite session.
         token_fingerprint = hashlib.sha256(
             self.bot_token.encode("utf-8")
         ).hexdigest()[:16]
@@ -92,73 +244,177 @@ class Worker:
             self.api_id,
             self.api_hash,
         )
+
+        self.resolver = TeraBoxBrowserResolver(max_concurrent=1)
+
+        self.size_inspection_queue: list[QueueTask] = []
+        self.download_queue: list[QueueTask] = []
+        self.active_task: QueueTask | None = None
+        self.inspecting_task: QueueTask | None = None
+        self.size_event = asyncio.Event()
+        self.download_event = asyncio.Event()
+        self.stop_event = asyncio.Event()
+
+        self.size_task: asyncio.Task | None = None
+        self.download_task: asyncio.Task | None = None
+        self.telegram_task: asyncio.Task | None = None
+
+        self.jobs: list[dict] = self._load_jobs()
+        self.link_counters: dict[str, tuple[str, int]] = {}
+
         log.info(
             "Telethon session selected by BOT_TOKEN fingerprint=%s",
             token_fingerprint,
         )
-        self.task: asyncio.Task | None = None
-        self.telegram_task: asyncio.Task | None = None
+
+    # ---------- persistence / queue helpers ----------
+
+    @staticmethod
+    def _load_jobs() -> list[dict]:
+        try:
+            if JOBS_FILE.exists():
+                value = json.loads(JOBS_FILE.read_text("utf-8"))
+                if isinstance(value, list):
+                    return value[:50]
+        except Exception:
+            log.exception("Failed to load jobs from disk")
+        return []
+
+    def _save_jobs(self) -> None:
+        try:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            tmp = JOBS_FILE.with_suffix(".tmp")
+            tmp.write_text(
+                json.dumps(self.jobs[:50], ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            tmp.replace(JOBS_FILE)
+        except Exception:
+            log.exception("Failed to save jobs")
+
+    def _link_counter(self, url: str) -> int:
+        normalized = normalize_link(url)
+        day = datetime.now().strftime("%Y-%m-%d")
+        existing = self.link_counters.get(normalized)
+        if existing and existing[0] == day:
+            return existing[1]
+        number = len(
+            [key for key, value in self.link_counters.items() if value[0] == day]
+        ) + 1
+        self.link_counters[normalized] = (day, number)
+        return number
+
+    def _link_counter_text(self, url: str) -> str:
+        return f"#{self._link_counter(url)}"
+
+    def _known_downloaded_size(self, url: str) -> int | None:
+        normalized = normalize_link(url)
+        for job in self.jobs:
+            if (
+                job.get("status") == "completed"
+                and normalize_link(str(job.get("url") or "")) == normalized
+                and job.get("files")
+            ):
+                return sum(
+                    int(item.get("sizeBytes") or 0)
+                    for item in job.get("files", [])
+                    if isinstance(item, dict)
+                )
+        return None
+
+    def _queued_count(self) -> int:
+        return len(self.size_inspection_queue) + len(self.download_queue)
+
+    def _queue_position(self) -> int:
+        return self._queued_count() + (1 if self.active_task else 0)
+
+    @staticmethod
+    def _sort_key(task: QueueTask) -> tuple[int, float]:
+        return (
+            task.size_bytes if task.size_bytes is not None else 2**63 - 1,
+            task.queued_at,
+        )
+
+    def _next_download_task(self) -> QueueTask | None:
+        if not self.download_queue:
+            return None
+        self.download_queue.sort(key=self._sort_key)
+        return self.download_queue.pop(0)
+
+    def _find_task(self, task_id: str) -> QueueTask | None:
+        if self.active_task and self.active_task.task_id == task_id:
+            return self.active_task
+        for task in self.size_inspection_queue:
+            if task.task_id == task_id:
+                return task
+        for task in self.download_queue:
+            if task.task_id == task_id:
+                return task
+        return None
+
+    def _remove_task(self, task: QueueTask) -> None:
+        for queue in (self.size_inspection_queue, self.download_queue):
+            try:
+                queue.remove(task)
+                return
+            except ValueError:
+                continue
+
+    async def _request_cancel(self, task: QueueTask) -> bool:
+        if task.cancel_requested:
+            return True
+        task.cancel_requested = True
+        self._remove_task(task)
+        return True
+
+    # ---------- lifecycle ----------
 
     async def start(self):
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
+        UNPACKED_DIR.mkdir(parents=True, exist_ok=True)
+
         log.info("Starting Chromium resolver...")
         await self.resolver.start()
 
         log.info("Removing any legacy Telegram Bot API webhook...")
         await self._delete_bot_api_webhook()
+        await self._set_bot_commands()
 
-        # Telegram authorization can temporarily return FloodWait. Do not
-        # block FastAPI startup or cause Hypercorn to restart the container.
-        self.telegram_task = asyncio.create_task(
-            self._connect_telegram_with_retry()
-        )
+        self.stop_event.clear()
+        self.size_task = asyncio.create_task(self._size_inspection_loop())
+        self.download_task = asyncio.create_task(self._download_queue_loop())
+        self.telegram_task = asyncio.create_task(self._connect_telegram_with_retry())
 
-        self.task = asyncio.create_task(self._queue_loop())
         log.info(
-            "VPS worker started; Telegram authorization is running in the background."
+            "VPS worker started; queue management and Telegram authorization are running in the background."
         )
 
-    async def _connect_telegram_with_retry(self):
-        registered = False
+    async def stop(self):
+        self.stop_event.set()
+        self.size_event.set()
+        self.download_event.set()
 
-        while True:
-            try:
-                log.info("Starting Telegram MTProto bot client on VPS...")
-                await self.telegram.start(bot_token=self.bot_token)
+        for task in (
+            self.size_task,
+            self.download_task,
+            self.telegram_task,
+        ):
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
-                if not registered:
-                    self.telegram.add_event_handler(
-                        self._on_message,
-                        events.NewMessage(incoming=True),
-                    )
-                    registered = True
+        self.size_task = None
+        self.download_task = None
+        self.telegram_task = None
 
-                me = await self.telegram.get_me()
-                log.info(
-                    "Telegram bot connected: username=@%s id=%s",
-                    getattr(me, "username", None),
-                    getattr(me, "id", None),
-                )
-                log.info(
-                    "VPS worker ready; Telegram intake is running directly on Oracle."
-                )
-                return
-            except FloodWaitError as exc:
-                wait_seconds = max(1, int(exc.seconds))
-                log.warning(
-                    "Telegram requested FloodWait=%ss during bot authorization. "
-                    "Keeping the worker alive and retrying after the wait.",
-                    wait_seconds,
-                )
-                if self.telegram.is_connected():
-                    await self.telegram.disconnect()
-                await asyncio.sleep(wait_seconds)
-            except Exception:
-                log.exception(
-                    "Telegram MTProto connection failed; retrying in 30 seconds."
-                )
-                if self.telegram.is_connected():
-                    await self.telegram.disconnect()
-                await asyncio.sleep(30)
+        if self.telegram.is_connected():
+            await self.telegram.disconnect()
+
+        await self.resolver.stop()
 
     async def _delete_bot_api_webhook(self):
         timeout = aiohttp.ClientTimeout(total=15, connect=8)
@@ -173,214 +429,812 @@ class Worker:
                     raise RuntimeError(f"Telegram deleteWebhook failed: {data}")
         log.info("Telegram Bot API webhook removed; Oracle will receive updates via MTProto.")
 
-    async def stop(self):
-        for task in (self.task, self.telegram_task):
-            if task:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
+    async def _set_bot_commands(self):
+        commands = [
+            {"command": "start", "description": "Start the bot"},
+            {"command": "queue", "description": "View the current download queue"},
+            {"command": "space", "description": "Check server storage"},
+            {"command": "status", "description": "Check bot status"},
+            {"command": "help", "description": "Show help"},
+            {"command": "cancel", "description": "Cancel an active or queued download"},
+        ]
+        timeout = aiohttp.ClientTimeout(total=15, connect=8)
+        api_url = f"https://api.telegram.org/bot{self.bot_token}/setMyCommands"
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(api_url, json={"commands": commands}) as response:
+                    data = await response.json(content_type=None)
+                    if response.status >= 400 or not data.get("ok"):
+                        log.warning("Telegram setMyCommands failed: %s", data)
+        except Exception:
+            log.exception("Could not register Telegram commands")
 
-        self.task = None
-        self.telegram_task = None
+    async def _connect_telegram_with_retry(self):
+        registered = False
+        while not self.stop_event.is_set():
+            try:
+                log.info("Starting Telegram MTProto bot client on VPS...")
+                await self.telegram.start(bot_token=self.bot_token)
 
-        if self.telegram.is_connected():
-            await self.telegram.disconnect()
+                if not registered:
+                    self.telegram.add_event_handler(
+                        self._on_message,
+                        events.NewMessage(incoming=True),
+                    )
+                    self.telegram.add_event_handler(
+                        self._on_callback,
+                        events.CallbackQuery(),
+                    )
+                    registered = True
 
-        await self.resolver.stop()
+                me = await self.telegram.get_me()
+                log.info(
+                    "Telegram bot connected: username=@%s id=%s",
+                    getattr(me, "username", None),
+                    getattr(me, "id", None),
+                )
+                log.info("VPS worker ready; Telegram intake is running directly on Oracle.")
+                return
+            except FloodWaitError as exc:
+                wait_seconds = max(1, int(exc.seconds))
+                log.warning(
+                    "Telegram requested FloodWait=%ss during bot authorization. "
+                    "Keeping the worker alive and retrying after the wait.",
+                    wait_seconds,
+                )
+                if self.telegram.is_connected():
+                    await self.telegram.disconnect()
+                await asyncio.sleep(wait_seconds)
+            except Exception:
+                log.exception("Telegram MTProto connection failed; retrying in 30 seconds.")
+                if self.telegram.is_connected():
+                    await self.telegram.disconnect()
+                await asyncio.sleep(30)
+
+    # ---------- telegram input ----------
 
     async def _on_message(self, event):
-        text = (event.raw_text or "").strip()
-        chat_id = event.chat_id
-
-        if not chat_id:
+        if not self.telegram.is_connected():
             return
 
-        if text in {"/start", "/help"}:
+        text = (event.raw_text or "").strip()
+        chat_id = event.chat_id
+        if not chat_id:
+            return
+        try:
+            chat_id = int(chat_id)
+        except (TypeError, ValueError):
+            return
+
+        command_token = text.split(None, 1)[0] if text else ""
+        command = command_token.split("@", 1)[0].lower()
+
+        if command == "/start":
             await event.reply(
-                "Send me a TeraBox link and I will resolve and send the file."
+                "👋 TeraBox Downloader Bot Active\n\n"
+                "Send me any supported TeraBox share link and I will download "
+                "the files and deliver them here.\n\n"
+                "Commands:\n"
+                "/queue — current download queue\n"
+                "/space — server storage\n"
+                "/status — bot status\n"
+                "/cancel [job/task id] — cancel a download\n"
+                "/help — help and usage"
             )
             return
 
-        urls = re.findall(r"https?://\S+", text)
-        if not urls:
+        if command == "/help":
+            await event.reply(
+                "📖 Help\n\n"
+                "1. Paste a TeraBox share link.\n"
+                "2. The bot inspects file names and sizes first.\n"
+                "3. Downloads are processed smallest-first once their sizes are known.\n"
+                "4. ZIP archives are unpacked automatically.\n"
+                "5. Videos use streamable Telegram delivery when possible.\n"
+                "6. Large files use direct MTProto upload first; if that fails, the bot splits them into parts.\n\n"
+                "Commands:\n"
+                "/queue — inspect waiting and active jobs\n"
+                "/space — storage and temporary disk usage\n"
+                "/status — worker and queue status\n"
+                "/cancel — cancel your active/queued job"
+            )
             return
 
-        url = urls[0].rstrip(").,>")
-        if not self._is_terabox_url(url):
+        if command == "/status":
+            await self._send_status_command(chat_id)
             return
 
-        job = Job(
-            job_id=uuid.uuid4().hex,
-            chat_id=int(chat_id),
+        if command == "/queue":
+            await self._send_queue_command(chat_id)
+            return
+
+        if command in {"/space", "/disk"}:
+            await self._send_space_command(chat_id)
+            return
+
+        if command == "/cancel":
+            argument = ""
+            if len(text.split(None, 1)) > 1:
+                argument = text.split(None, 1)[1].strip().split()[0]
+            await self._cancel_from_command(chat_id, argument)
+            return
+
+        url = extract_url_from_text(text)
+        if not url or not is_terabox_url(url):
+            return
+
+        if self._queue_position() >= MAX_QUEUE_SIZE:
+            await event.reply("⚠️ The download queue is full. Please try again later.")
+            return
+
+        task = QueueTask(
+            task_id=uuid.uuid4().hex,
+            chat_id=chat_id,
             url=url,
+        )
+        self.size_inspection_queue.append(task)
+        self.size_event.set()
+
+        position = self._queue_position()
+        await event.reply(
+            f"📋 Queued your TeraBox link.\n"
+            f"Job/task: {task.task_id[:8]}\n"
+            f"Queue position: {position}\n\n"
+            f"🔎 First checking file names and sizes…",
+            buttons=[[Button.inline("🛑 Cancel", data=f"cancel:{task.task_id}".encode())]],
         )
 
         log.info(
-            "telegram message accepted job=%s chat_id=%s queue_size_before=%s url=%s",
-            job.job_id,
-            job.chat_id,
-            self.queue.qsize(),
-            job.url,
+            "telegram message accepted task=%s chat_id=%s queue_size_before=%s url=%s",
+            task.task_id,
+            chat_id,
+            position - 1,
+            url,
         )
 
-        await event.reply(
-            f"⏳ Queued your TeraBox link. Job: {job.job_id[:8]}"
-        )
-        await self.queue.put(job)
-
-    async def _queue_loop(self):
-        while True:
-            job = await self.queue.get()
-            try:
-                await self._run_job(job)
-            except Exception:
-                log.exception("Unhandled job failure id=%s", job.job_id)
-                try:
-                    await self.telegram.send_message(
-                        job.chat_id,
-                        f"❌ Job {job.job_id[:8]} failed unexpectedly.",
-                    )
-                except Exception:
-                    log.exception("Could not send unexpected-failure message id=%s", job.job_id)
-            finally:
-                self.queue.task_done()
-
-    async def _run_job(self, job: Job):
-        started = time.monotonic()
-        temp_path: Path | None = None
-
-        await self._status(job, "🔎 Resolving TeraBox link…")
+    async def _on_callback(self, event):
         try:
-            log.info("job=%s resolving url=%s", job.job_id, job.url)
+            raw = event.data or b""
+            data = raw.decode("utf-8", "replace")
+        except Exception:
+            data = ""
 
-            resolved = await self.resolver.resolve(job.url)
-            filename = self._safe_filename(
-                resolved.get("file_name") or "terabox-file"
+        if not data.startswith("cancel:"):
+            return
+
+        task_id = data.split(":", 1)[1].strip()
+        task = self._find_task(task_id)
+        if not task:
+            await event.answer("This download has already finished.", alert=True)
+            return
+
+        if task.cancel_requested:
+            await event.answer("Cancellation already requested.")
+            return
+
+        await self._request_cancel(task)
+        await event.answer("Cancellation requested.")
+        try:
+            if event.chat_id:
+                await self.telegram.send_message(
+                    event.chat_id,
+                    f"🛑 Cancellation requested for {task_id[:8]}.",
+                )
+        except Exception:
+            pass
+
+    async def _cancel_from_command(self, chat_id: int, argument: str):
+        task: QueueTask | None = None
+
+        if argument:
+            task = self._find_task(argument)
+        else:
+            if self.active_task and self.active_task.chat_id == chat_id:
+                task = self.active_task
+            else:
+                candidates = [
+                    item
+                    for item in self.size_inspection_queue + self.download_queue
+                    if item.chat_id == chat_id
+                ]
+                if candidates:
+                    task = min(candidates, key=lambda item: item.queued_at)
+
+        if not task or task.chat_id != chat_id:
+            await self.telegram.send_message(
+                chat_id,
+                "ℹ️ No matching active or queued download was found.",
             )
-            size = int(resolved.get("size") or 0)
-            direct_url = str(resolved.get("direct_url") or "").strip()
-            stream_url = str(resolved.get("stream_url") or "").strip()
-            browser_download_path = str(
-                resolved.get("browser_download_path") or ""
-            ).strip()
-            download_mode = str(resolved.get("download_mode") or "").strip()
+            return
 
-            if not direct_url and not stream_url and not browser_download_path:
+        await self._request_cancel(task)
+        await self.telegram.send_message(
+            chat_id,
+            f"🛑 Cancellation requested for {task.task_id[:8]}.",
+        )
+
+    # ---------- queue commands ----------
+
+    async def _send_status_command(self, chat_id: int):
+        active = self.active_task
+        active_name = (
+            ", ".join(active.file_names)
+            if active and active.file_names
+            else "Nothing"
+        )
+        completed = sum(1 for job in self.jobs if job.get("status") == "completed")
+        failed = sum(1 for job in self.jobs if job.get("status") == "failed")
+
+        text = (
+            "⚡ Bot Status\n\n"
+            f"Telegram: {'Online' if self.telegram.is_connected() else 'Connecting'}\n"
+            f"Browser: {'Ready' if self.resolver.browser else 'Starting'}\n"
+            f"🔄 Active: {active_name}\n"
+            f"🔎 Finding sizes: {len(self.size_inspection_queue) + (1 if self.inspecting_task else 0)}\n"
+            f"📦 Ready to download: {len(self.download_queue)}\n"
+            f"📁 Processed jobs: {len(self.jobs)}\n"
+            f"✅ Completed: {completed}\n"
+            f"❌ Failed: {failed}"
+        )
+        await self.telegram.send_message(chat_id, text)
+
+    def _queue_task_line(self, index: int, task: QueueTask) -> str:
+        file_label = (
+            "Checking file names…"
+            if task.file_names is None
+            else ", ".join(task.file_names)
+            if task.file_names
+            else "File names unavailable"
+        )
+        if task.size_bytes and task.size_bytes > 0:
+            size = format_bytes(task.size_bytes)
+            if task.size_is_estimated:
+                size = "~" + size + " estimated"
+        else:
+            size = "Size unavailable"
+        return f"{index}. {file_label} ({size}) [{task.task_id[:8]}]"
+
+    async def _send_queue_command(self, chat_id: int):
+        active = self.active_task
+        active_line = "🔄 Now processing: Nothing"
+        if active:
+            names = ", ".join(active.file_names or ["Working…"])
+            size = format_bytes(active.size_bytes or 0) if active.size_bytes else ""
+            active_line = (
+                f"🔄 Now processing: {names}"
+                + (f" ({size})" if size else "")
+                + f" [{active.task_id[:8]}]"
+            )
+
+        inspection = (
+            "\n".join(self._queue_task_line(i + 1, task) for i, task in enumerate(self.size_inspection_queue))
+            if self.size_inspection_queue
+            else "Empty"
+        )
+        ready = sorted(self.download_queue, key=self._sort_key)
+        queue_lines = (
+            "\n".join(self._queue_task_line(i + 1, task) for i, task in enumerate(ready))
+            if ready
+            else "Empty"
+        )
+
+        text = (
+            "📋 Download Queue\n\n"
+            + active_line
+            + "\n\n"
+            + f"🔎 Finding file sizes ({len(self.size_inspection_queue) + (1 if self.inspecting_task else 0)}):\n{inspection}\n\n"
+            + f"⏳ Download queue ({len(ready)} waiting, smallest first):\n{queue_lines}"
+        )
+        await self.telegram.send_message(chat_id, text[:3900])
+
+    async def _send_space_command(self, chat_id: int):
+        try:
+            stat = os.statvfs(DATA_DIR)
+            total_bytes = int(stat.f_blocks * stat.f_frsize)
+            free_bytes = int(stat.f_bavail * stat.f_frsize)
+            used_bytes = total_bytes - int(stat.f_bfree * stat.f_frsize)
+        except OSError:
+            total_bytes = free_bytes = used_bytes = 0
+
+        used_percent = round(used_bytes * 100 / total_bytes) if total_bytes else 0
+        bot_files = get_directory_size(DATA_DIR)
+        temporary_downloads = get_directory_size(DOWNLOADS_DIR)
+        unpacked_files = get_directory_size(UNPACKED_DIR)
+
+        text = (
+            "💾 Bot Storage\n\n"
+            f"📦 Bot files: {format_bytes(bot_files)}\n"
+            f"⬇️ Temporary downloads: {format_bytes(temporary_downloads)}\n"
+            f"🗜️ Unpacked files: {format_bytes(unpacked_files)}\n"
+            "🧹 Cleanup: after every job and on startup\n"
+            f"⏳ Queue: {'1 active' if self.active_task else 'No active job'}, "
+            f"{self._queued_count()} waiting\n\n"
+            "🖥️ Container filesystem reference\n"
+            f"• Used: {format_bytes(used_bytes)} ({used_percent}%)\n"
+            f"• Free: {format_bytes(free_bytes)}\n"
+            f"• Total: {format_bytes(total_bytes)}\n"
+            f"• Location: {DATA_DIR}"
+        )
+        await self.telegram.send_message(chat_id, text)
+
+    # ---------- size inspection ----------
+
+    async def _size_inspection_loop(self):
+        while not self.stop_event.is_set():
+            await self.size_event.wait()
+            self.size_event.clear()
+
+            while self.size_inspection_queue and not self.stop_event.is_set():
+                task = self.size_inspection_queue.pop(0)
+                if task.cancel_requested:
+                    continue
+
+                self.inspecting_task = task
+                try:
+                    log.info("task=%s inspecting TeraBox metadata", task.task_id)
+                    metadata = await self.resolver.resolve(task.url)
+                    files = [
+                        item for item in (metadata.get("files") or [])
+                        if isinstance(item, dict) and not item.get("is_dir")
+                    ]
+                    if not files and metadata.get("file_name"):
+                        files = [{
+                            "file_name": metadata.get("file_name"),
+                            "size": int(metadata.get("size") or 0),
+                            "fs_id": metadata.get("fs_id") or "",
+                            "direct_url": metadata.get("direct_url") or "",
+                            "stream_url": metadata.get("stream_url") or "",
+                        }]
+
+                    task.file_names = [
+                        safe_filename(str(item.get("file_name") or "terabox-file"))
+                        for item in files
+                    ]
+                    total = sum(int(item.get("size") or 0) for item in files)
+                    known = self._known_downloaded_size(task.url)
+                    task.size_bytes = known if known is not None else total
+                    task.size_is_estimated = known is None
+
+                    if not task.file_names:
+                        task.file_names = []
+                        task.size_bytes = None
+                except Exception as exc:
+                    log.warning(
+                        "task=%s metadata inspection failed: %s",
+                        task.task_id,
+                        self._compact_error(exc),
+                    )
+                    task.file_names = []
+                    task.size_bytes = None
+                    task.size_is_estimated = False
+                finally:
+                    self.inspecting_task = None
+
+                if not task.cancel_requested:
+                    self.download_queue.append(task)
+                    self.download_event.set()
+
+    # ---------- download queue ----------
+
+    async def _download_queue_loop(self):
+        while not self.stop_event.is_set():
+            await self.download_event.wait()
+            self.download_event.clear()
+
+            while self.download_queue and not self.stop_event.is_set():
+                task = self._next_download_task()
+                if not task:
+                    break
+                if task.cancel_requested:
+                    continue
+
+                self.active_task = task
+                try:
+                    await self._run_job(task)
+                except Exception:
+                    log.exception("Unhandled job failure task=%s", task.task_id)
+                finally:
+                    if self.active_task is task:
+                        self.active_task = None
+
+    async def _run_job(self, task: QueueTask):
+        started = time.monotonic()
+        job_id = f"job_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
+        task.job_id = job_id
+
+        job_dir = DOWNLOADS_DIR / job_id
+        unpack_dir = UNPACKED_DIR / job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+        unpack_dir.mkdir(parents=True, exist_ok=True)
+
+        link_counter = self._link_counter_text(task.url)
+        job = {
+            "id": job_id,
+            "taskId": task.task_id,
+            "url": task.url,
+            "linkCounter": self._link_counter(task.url),
+            "status": "resolving",
+            "progress": 10,
+            "statusText": "Analyzing TeraBox share link...",
+            "files": [],
+            "chatId": str(task.chat_id),
+            "retryCount": task.retry_count,
+            "maxRetries": 1,
+            "createdAt": int(time.time() * 1000),
+            "logs": [
+                f"[{datetime.now().strftime('%H:%M:%S')}] Job initialized for {task.url} (link {link_counter})"
+            ],
+        }
+        self.jobs.insert(0, job)
+        self.jobs = self.jobs[:50]
+        self._save_jobs()
+
+        await self._status(
+            job,
+            task,
+            "🔎 Checking your TeraBox link…",
+        )
+
+        try:
+            resolved = await self.resolver.resolve(task.url)
+            files = [
+                item for item in (resolved.get("files") or [])
+                if isinstance(item, dict) and not item.get("is_dir")
+            ]
+
+            top_level = {
+                "file_name": resolved.get("file_name") or "terabox-file",
+                "size": int(resolved.get("size") or 0),
+                "fs_id": resolved.get("fs_id") or "",
+                "direct_url": resolved.get("direct_url") or "",
+                "stream_url": resolved.get("stream_url") or "",
+                "browser_download_path": resolved.get("browser_download_path") or "",
+                "duration": int(resolved.get("duration") or 0),
+                "sign": resolved.get("sign") or "",
+                "timestamp": resolved.get("timestamp") or "",
+            }
+            if not files and (
+                top_level["direct_url"]
+                or top_level["stream_url"]
+                or top_level["browser_download_path"]
+            ):
+                files = [top_level]
+
+            files = [
+                item
+                for item in files
+                if item.get("direct_url")
+                or item.get("stream_url")
+                or item.get("browser_download_path")
+            ]
+
+            if not files:
                 raise RuntimeError(
-                    "Resolver returned neither a direct download URL nor an HLS stream URL."
+                    "No downloadable files were found in this TeraBox link."
+                )
+            if len(files) > MAX_FILES_PER_LINK:
+                raise RuntimeError(
+                    f"This link contains too many files. The maximum is {MAX_FILES_PER_LINK}."
                 )
 
-            log.info(
-                "job=%s resolved file=%s size=%s mode=%s resolve_ms=%s",
-                job.job_id,
-                filename,
-                size,
-                download_mode or ("direct" if direct_url else "stream"),
-                resolved.get("resolve_ms"),
-            )
-
+            total_source_size = sum(int(item.get("size") or 0) for item in files)
             await self._status(
                 job,
-                f"✅ Resolved: {filename}\n⬇️ Starting download…",
+                task,
+                f"✅ Found {len(files)} file(s), about {format_bytes(total_source_size)}.\n⬇️ Starting download…",
             )
 
-            if browser_download_path:
-                browser_path = Path(browser_download_path)
-                if not browser_path.exists():
-                    raise RuntimeError(
-                        "Chromium reported a downloaded file, but the temporary file is missing."
-                    )
-                temp_path = browser_path
-                downloaded_size = browser_path.stat().st_size
-                if downloaded_size <= 0:
-                    raise RuntimeError("Chromium downloaded an empty file.")
-                if size and downloaded_size != size:
-                    raise RuntimeError(
-                        f"Browser download size mismatch: expected {size} bytes, "
-                        f"received {downloaded_size} bytes."
-                    )
-                log.info(
-                    "job=%s using native browser download file=%s size=%s",
-                    job.job_id,
-                    filename,
-                    downloaded_size,
+            processed_files: list[dict] = []
+            failed_files: list[str] = []
+
+            browser_download_path = str(resolved.get("browser_download_path") or "")
+            browser_download_used = False
+
+            for index, source in enumerate(files):
+                self._check_cancel(task)
+
+                original_name = safe_filename(
+                    str(source.get("file_name") or f"file_{index + 1}")
                 )
-            elif stream_url and not direct_url:
-                temp_path, downloaded_size = await self._download_stream(
+                expected_size = int(source.get("size") or 0)
+                if expected_size > MAX_SOURCE_FILE_SIZE_BYTES:
+                    raise RuntimeError(
+                        f"{original_name} exceeds MAX_SOURCE_FILE_SIZE_BYTES."
+                    )
+
+                await self._status(
                     job,
-                    stream_url,
-                    filename,
-                    resolved,
-                )
-            else:
-                temp_path, downloaded_size = await self._download(
-                    job, direct_url, filename, expected_size=size
+                    task,
+                    f"⬇️ Downloading {original_name} ({index + 1}/{len(files)})…",
+                    progress=20 + round(index * 60 / max(1, len(files))),
                 )
 
-            await self._status(job, f"📤 Uploading {filename} to Telegram…")
+                downloaded_path: Path | None = None
+                candidate_name = original_name
 
-            await self._send_file(job.chat_id, temp_path, filename)
+                try:
+                    if (
+                        browser_download_path
+                        and not browser_download_used
+                        and (
+                            not source.get("fs_id")
+                            or str(source.get("fs_id")) == str(resolved.get("fs_id") or "")
+                            or index == 0
+                        )
+                    ):
+                        path = Path(browser_download_path)
+                        if path.exists():
+                            downloaded_path = path
+                            browser_download_used = True
+
+                    if downloaded_path is None and source.get("direct_url"):
+                        downloaded_path, _ = await self._download_direct(
+                            task,
+                            str(source["direct_url"]),
+                            candidate_name,
+                            expected_size=expected_size,
+                            cookies=str(resolved.get("cookies") or ""),
+                            referer=str(
+                                resolved.get("referer_url")
+                                or "https://www.terabox.app/"
+                            ),
+                        )
+
+                    if downloaded_path is None and source.get("stream_url"):
+                        if not candidate_name.lower().endswith(".mp4"):
+                            candidate_name = re.sub(r"\.[^.]+$", "", candidate_name) + ".mp4"
+                        downloaded_path, _ = await self._download_hls(
+                            job,
+                            task,
+                            str(source["stream_url"]),
+                            candidate_name,
+                            resolved,
+                            source,
+                        )
+
+                    if downloaded_path is None:
+                        raise RuntimeError("The file could not be downloaded.")
+
+                    actual_size = downloaded_path.stat().st_size
+                    if actual_size <= 0:
+                        raise RuntimeError("Downloaded file is empty.")
+                    if expected_size and actual_size != expected_size:
+                        raise RuntimeError(
+                            f"Downloaded size mismatch: expected {expected_size} bytes, received {actual_size} bytes."
+                        )
+
+                    header = downloaded_path.read_bytes()[:64]
+                    detected = detect_extension_from_buffer(header)
+                    if detected and not candidate_name.lower().endswith(detected):
+                        candidate_name = candidate_name + detected
+                        renamed = downloaded_path.with_name(
+                            f"{downloaded_path.stem}_{safe_filename(candidate_name)}"
+                        )
+                        downloaded_path.rename(renamed)
+                        downloaded_path = renamed
+
+                    suffix = Path(candidate_name).suffix.lower()
+                    is_zip = suffix == ".zip" or detected == ".zip"
+                    is_video = suffix in VIDEO_EXTENSIONS
+
+                    if is_zip and downloaded_path.stat().st_size > MAX_ZIP_SIZE_BYTES:
+                        raise RuntimeError(
+                            "This ZIP archive is too large to unpack safely."
+                        )
+
+                    if is_zip:
+                        await self._status(
+                            job,
+                            task,
+                            f"📦 Unpacking {candidate_name}…",
+                            progress=70,
+                        )
+                        extracted = await asyncio.to_thread(
+                            self._unpack_zip,
+                            downloaded_path,
+                            unpack_dir / str(index),
+                        )
+                        if extracted:
+                            for extracted_file in extracted:
+                                ext = extracted_file.suffix.lower()
+                                processed_files.append(
+                                    {
+                                        "filename": extracted_file.name,
+                                        "sizeBytes": extracted_file.stat().st_size,
+                                        "sizeFormatted": format_bytes(extracted_file.stat().st_size),
+                                        "path": str(extracted_file),
+                                        "isVideo": ext in VIDEO_EXTENSIONS,
+                                        "isZip": False,
+                                    }
+                                )
+                            continue
+
+                    processed_files.append(
+                        {
+                            "filename": candidate_name,
+                            "sizeBytes": downloaded_path.stat().st_size,
+                            "sizeFormatted": format_bytes(downloaded_path.stat().st_size),
+                            "path": str(downloaded_path),
+                            "isVideo": is_video,
+                            "isZip": is_zip,
+                        }
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    log.warning(
+                        "Could not process %s: %s",
+                        original_name,
+                        self._compact_error(exc),
+                    )
+                    if downloaded_path and downloaded_path.exists():
+                        try:
+                            if downloaded_path.parent not in {job_dir, unpack_dir}:
+                                downloaded_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                    failed_files.append(original_name)
+
+            if not processed_files:
+                raise RuntimeError(
+                    "None of the files in this TeraBox link could be downloaded."
+                )
+
+            job["files"] = processed_files
+            job["status"] = "uploading"
+            job["progress"] = 85
+            job["statusText"] = "Uploading files to Telegram..."
+            self._save_jobs()
+
+            if failed_files:
+                await self.telegram.send_message(
+                    task.chat_id,
+                    "⚠️ Could not download: " + ", ".join(failed_files[:15]),
+                )
+
+            for index, processed in enumerate(processed_files):
+                self._check_cancel(task)
+                path = Path(str(processed["path"]))
+                if not path.exists():
+                    continue
+
+                await self._status(
+                    job,
+                    task,
+                    f"📤 Sending {processed['filename']} ({index + 1}/{len(processed_files)})…",
+                    progress=85 + round(index * 13 / max(1, len(processed_files))),
+                )
+                await self._upload_processed(
+                    job,
+                    task,
+                    path,
+                    str(processed["filename"]),
+                    bool(processed.get("isVideo")),
+                    int(processed.get("sizeBytes") or path.stat().st_size),
+                    index,
+                    len(processed_files),
+                    job_dir,
+                )
 
             elapsed = round(time.monotonic() - started, 2)
+            job["status"] = "completed"
+            job["progress"] = 100
+            job["statusText"] = "Completed successfully"
+            job["completedAt"] = int(time.time() * 1000)
+            job["logs"].append(
+                f"[{datetime.now().strftime('%H:%M:%S')}] Finished job processing in {elapsed}s"
+            )
+            self._save_jobs()
+
+            await self._status(
+                job,
+                task,
+                f"✅ Sent successfully: {len(processed_files)} file(s)\n⏱ {elapsed}s",
+                progress=100,
+                include_cancel_button=False,
+            )
             log.info(
-                "job=%s completed filename=%s size=%s elapsed=%ss",
-                job.job_id,
-                filename,
-                downloaded_size,
+                "job=%s completed files=%s elapsed=%ss",
+                job_id,
+                len(processed_files),
                 elapsed,
             )
-
-            await self._status(
-                job,
-                f"✅ Sent successfully: {filename}\n⏱ {elapsed}s",
-            )
+        except asyncio.CancelledError:
+            job["status"] = "failed"
+            job["error"] = "Cancelled by worker shutdown"
+            job["statusText"] = "Cancelled by worker shutdown"
+            self._save_jobs()
+            raise
         except Exception as exc:
-            log.exception("job=%s failed", job.job_id)
-            await self._status(
-                job,
-                f"❌ TeraBox delivery failed: {self._compact_error(exc)}",
+            error_text = self._compact_error(exc)
+            job["status"] = "failed"
+            job["error"] = error_text
+            job["statusText"] = f"Failed: {error_text}"
+            job["logs"].append(
+                f"[{datetime.now().strftime('%H:%M:%S')}] Error: {error_text}"
             )
-        finally:
-            if temp_path:
-                try:
-                    temp_path.unlink(missing_ok=True)
-                except Exception:
-                    log.warning("Could not remove temp file %s", temp_path)
+            self._save_jobs()
 
-    async def _download(self, job: Job, url: str, filename: str, *, expected_size: int = 0) -> tuple[Path, int]:
+            if task.cancel_requested:
+                await self._status(
+                    job,
+                    task,
+                    f"🛑 Download cancelled.\n🔗 {task.url}",
+                    include_cancel_button=False,
+                )
+            else:
+                await self._status(
+                    job,
+                    task,
+                    f"❌ Unable to download this link.\n{error_text}",
+                    include_cancel_button=False,
+                )
+            log.exception("job=%s failed", job_id)
+        finally:
+            self._cleanup_job_dir(job_dir, unpack_dir)
+
+    async def _download_direct(
+        self,
+        task: QueueTask,
+        url: str,
+        filename: str,
+        *,
+        expected_size: int = 0,
+        cookies: str = "",
+        referer: str = "",
+    ) -> tuple[Path, int]:
         timeout = aiohttp.ClientTimeout(total=None, connect=20, sock_read=120)
-        tmp = tempfile.NamedTemporaryFile(
-            prefix=f"terabox-{job.job_id}-",
-            suffix=Path(filename).suffix or ".bin",
-            delete=False,
-            dir="/tmp",
+        suffix = Path(filename).suffix or ".bin"
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f"terabox-{task.task_id}-",
+            suffix=suffix,
+            dir=str(DOWNLOADS_DIR / "active"),
         )
-        path = Path(tmp.name)
+        os.close(fd)
+        path = Path(temp_name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
         total = 0
-        last_log = 0
-        last_messenger_update = 0
-        last_messenger_percent = -1
+        content_length = 0
+        blocked_types = {
+            "text/html",
+            "text/plain",
+            "application/json",
+            "application/xml",
+            "text/xml",
+        }
 
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(
                     url,
-                    headers={"User-Agent": "Mozilla/5.0", "Accept": "*/*"},
+                    headers={
+                        "User-Agent": (
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/131.0.0.0 Safari/537.36"
+                        ),
+                        "Accept": "*/*",
+                        "Referer": referer or "https://www.terabox.app/",
+                        **({"Cookie": cookies} if cookies else {}),
+                    },
                     allow_redirects=True,
                 ) as response:
                     response.raise_for_status()
                     content_length = int(response.headers.get("Content-Length") or 0)
                     content_type = (
-                        response.headers.get("Content-Type")
-                        or ""
+                        response.headers.get("Content-Type") or ""
                     ).split(";", 1)[0].strip().lower()
-                    declared = max(expected_size, content_length)
 
+                    if content_type in blocked_types:
+                        raise RuntimeError(
+                            f"Resolved URL returned a non-file response ({content_type})."
+                        )
+
+                    declared = max(expected_size, content_length)
                     log.info(
-                        "job=%s downloading HTTP=%s expected_size=%s content_length=%s content_type=%s final_url=%s",
-                        job.job_id,
+                        "task=%s direct download HTTP=%s expected=%s content_length=%s type=%s final=%s",
+                        task.task_id,
                         response.status,
                         expected_size,
                         content_length,
@@ -388,189 +1242,312 @@ class Worker:
                         response.url,
                     )
 
-                    blocked_types = {
-                        "text/html",
-                        "text/plain",
-                        "application/json",
-                        "application/xml",
-                        "text/xml",
-                    }
-                    if content_type in blocked_types:
-                        raise RuntimeError(
-                            "Resolved URL returned a non-file response "
-                            f"({content_type}); refusing to upload it."
-                        )
-
-                    with tmp:
+                    with path.open("wb") as output:
                         async for chunk in response.content.iter_chunked(1024 * 1024):
+                            self._check_cancel(task)
                             total += len(chunk)
-                            if total > self.max_download_bytes:
+                            if total > MAX_DOWNLOAD_BYTES:
                                 raise RuntimeError(
-                                    f"File exceeds MAX_DOWNLOAD_BYTES ({self.max_download_bytes})."
+                                    f"File exceeds MAX_DOWNLOAD_BYTES ({MAX_DOWNLOAD_BYTES})."
                                 )
-                            tmp.write(chunk)
+                            output.write(chunk)
 
-                            now = time.monotonic()
-                            if now - last_log >= 5:
-                                last_log = now
-                                if declared:
-                                    percent = min(100, int(total * 100 / declared))
-                                    log.info(
-                                        "job=%s download_progress=%s/%s bytes (%s%%)",
-                                        job.job_id, total, declared, percent
-                                    )
-                                    if (
-                                        percent >= last_messenger_percent + 10
-                                        and now - last_messenger_update >= 10
-                                    ):
-                                        last_messenger_percent = percent
-                                        last_messenger_update = now
-                                        await self._status(
-                                            job,
-                                            f"⬇️ Downloading {filename}: {percent}%",
-                                        )
-                                else:
-                                    log.info(
-                                        "job=%s download_progress=%s bytes",
-                                        job.job_id, total
-                                    )
+                            if declared and total and total % (16 * 1024 * 1024) < len(chunk):
+                                log.info(
+                                    "task=%s download_progress=%s%%",
+                                    task.task_id,
+                                    min(100, round(total * 100 / declared)),
+                                )
+
+            if total <= 0:
+                raise RuntimeError("TeraBox direct URL returned an empty file.")
+            if expected_size and total != expected_size:
+                raise RuntimeError(
+                    f"TeraBox download size mismatch: expected {expected_size} bytes, received {total} bytes."
+                )
+            return path, total
         except Exception:
-            try:
-                path.unlink(missing_ok=True)
-            except Exception:
-                pass
+            path.unlink(missing_ok=True)
             raise
 
-        if total <= 0:
-            path.unlink(missing_ok=True)
-            raise RuntimeError("TeraBox direct URL returned an empty file.")
-
-        if expected_size and total != expected_size:
-            path.unlink(missing_ok=True)
-            raise RuntimeError(
-                f"TeraBox download size mismatch: expected {expected_size} bytes, "
-                f"received {total} bytes."
-            )
-
-        return path, total
-
-    async def _download_stream(
+    async def _download_hls(
         self,
-        job: Job,
+        job: dict,
+        task: QueueTask,
         stream_url: str,
         filename: str,
         resolved: dict,
+        source: dict,
     ) -> tuple[Path, int]:
         suffix = Path(filename).suffix or ".mp4"
-        tmp = tempfile.NamedTemporaryFile(
-            prefix=f"terabox-{job.job_id}-",
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f"terabox-hls-{task.task_id}-",
             suffix=suffix,
-            delete=False,
-            dir="/tmp",
+            dir=str(DOWNLOADS_DIR / "active"),
         )
-        path = Path(tmp.name)
-        tmp.close()
+        os.close(fd)
+        path = Path(temp_name)
 
-        last_messenger_update = 0.0
+        last_status = 0.0
         last_percent = -1
 
         async def progress(percent: int, current: int, total: int):
-            nonlocal last_messenger_update, last_percent
+            nonlocal last_status, last_percent
+            self._check_cancel(task)
             now = time.monotonic()
-            if (
-                percent == 100
-                or percent >= last_percent + 10
-                and now - last_messenger_update >= 10
+            if percent == 100 or (
+                percent >= last_percent + 10 and now - last_status >= 8
             ):
                 last_percent = percent
-                last_messenger_update = now
+                last_status = now
                 await self._status(
                     job,
-                    f"⬇️ Downloading {filename}: {percent}% "
-                    f"({current}/{total} chunks)",
+                    task,
+                    f"⬇️ Downloading {filename}: {percent}% ({current}/{total} chunks)",
                 )
 
         try:
-            downloaded_size, chunk_count = await download_m3u8_stream(
+            await download_m3u8_stream(
                 stream_url,
                 path,
                 referer_url=str(
-                    resolved.get("referer_url")
-                    or "https://www.terabox.app/"
+                    resolved.get("referer_url") or "https://www.terabox.app/"
                 ),
                 cookie_header=str(resolved.get("cookies") or ""),
-                duration=int(resolved.get("duration") or 0),
-                share_id=str(
-                    resolved.get("share_id")
-                    or resolved.get("shareid")
-                    or ""
-                ),
+                duration=int(source.get("duration") or resolved.get("duration") or 0),
+                share_id=str(resolved.get("share_id") or ""),
                 uk=str(resolved.get("uk") or ""),
-                sign=str(resolved.get("sign") or ""),
-                timestamp=str(resolved.get("timestamp") or ""),
-                fs_id=str(resolved.get("fs_id") or ""),
+                sign=str(source.get("sign") or resolved.get("sign") or ""),
+                timestamp=str(
+                    source.get("timestamp") or resolved.get("timestamp") or ""
+                ),
+                fs_id=str(source.get("fs_id") or resolved.get("fs_id") or ""),
                 randsk=str(resolved.get("randsk") or ""),
                 progress=progress,
             )
-            log.info(
-                "job=%s HLS download completed chunks=%s bytes=%s",
-                job.job_id,
-                chunk_count,
-                downloaded_size,
-            )
-            return path, downloaded_size
+            size = path.stat().st_size
+            if size <= 0:
+                raise RuntimeError("M3U8 download produced an empty output file.")
+            if size > MAX_DOWNLOAD_BYTES:
+                raise RuntimeError(
+                    f"File exceeds MAX_DOWNLOAD_BYTES ({MAX_DOWNLOAD_BYTES})."
+                )
+            return path, size
         except Exception:
             path.unlink(missing_ok=True)
             raise
 
-    async def _send_file(self, chat_id: int, path: Path, filename: str):
-        streaming_extensions = {
-            ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v",
-            ".mp3", ".m4a", ".aac",
-        }
-        supports_streaming = path.suffix.lower() in streaming_extensions
+    @staticmethod
+    def _unpack_zip(zip_path: Path, target_dir: Path) -> list[Path]:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        extracted: list[Path] = []
+        used_names: set[str] = set()
 
+        with zipfile.ZipFile(zip_path) as archive:
+            for member in archive.infolist():
+                if member.is_dir() or member.filename.startswith("__MACOSX/"):
+                    continue
+
+                filename = safe_filename(Path(member.filename).name)
+                if not filename:
+                    continue
+
+                base = Path(filename).stem
+                suffix = Path(filename).suffix
+                index = 1
+                unique = filename
+                while unique in used_names:
+                    unique = f"{base}_{index}{suffix}"
+                    index += 1
+                used_names.add(unique)
+
+                output = target_dir / unique
+                with archive.open(member, "r") as source, output.open("wb") as destination:
+                    shutil.copyfileobj(source, destination, length=1024 * 1024)
+                extracted.append(output)
+
+        return extracted
+
+    # ---------- telegram uploads ----------
+
+    async def _upload_processed(
+        self,
+        job: dict,
+        task: QueueTask,
+        path: Path,
+        filename: str,
+        is_video: bool,
+        size_bytes: int,
+        index: int,
+        total_files: int,
+        job_dir: Path,
+    ) -> None:
+        caption_prefix = self._link_counter_text(task.url)
+
+        if size_bytes <= MAX_TELEGRAM_FILE_SIZE:
+            await self._send_via_mtproto(
+                task.chat_id,
+                path,
+                filename,
+                (
+                    f"🎬 [Video Preview] {caption_prefix} {filename} ({format_bytes(size_bytes)})"
+                    if is_video
+                    else f"📄 [{index + 1}/{total_files}] {caption_prefix} {filename} ({format_bytes(size_bytes)})"
+                ),
+                is_video=is_video,
+            )
+            return
+
+        await self.telegram.send_message(
+            task.chat_id,
+            f"📦 Large file detected: {filename} ({format_bytes(size_bytes)}). Sending…",
+        )
+
+        if size_bytes <= MAX_MT_PROTO_FILE_SIZE:
+            try:
+                await self._send_via_mtproto(
+                    task.chat_id,
+                    path,
+                    filename,
+                    f"🎬 [Video Preview] {caption_prefix} {filename} ({format_bytes(size_bytes)})"
+                    if is_video
+                    else f"📦 {caption_prefix} {filename} ({format_bytes(size_bytes)})",
+                    is_video=is_video,
+                )
+                return
+            except Exception as exc:
+                log.warning(
+                    "MTProto direct upload failed for %s; falling back to parts: %s",
+                    filename,
+                    self._compact_error(exc),
+                )
+
+        parts = (
+            await split_video(path, job_dir, MAX_TELEGRAM_FILE_SIZE)
+            if is_video
+            else split_binary_file(path, job_dir, MAX_TELEGRAM_FILE_SIZE)
+        )
+        if len(parts) <= 1:
+            raise RuntimeError("Large-file split fallback produced no smaller parts.")
+
+        for part_index, part in enumerate(parts, 1):
+            self._check_cancel(task)
+            part_size = part.stat().st_size
+            caption = (
+                f"🎬 [Video Part {part_index}/{len(parts)}] "
+                f"{caption_prefix} {part.name} ({format_bytes(part_size)})"
+                if is_video
+                else f"📦 [Part {part_index}/{len(parts)}] "
+                f"{caption_prefix} {part.name} ({format_bytes(part_size)})"
+            )
+            await self._send_via_mtproto(
+                task.chat_id,
+                part,
+                part.name,
+                caption,
+                is_video=is_video,
+            )
+
+    async def _send_via_mtproto(
+        self,
+        chat_id: int,
+        path: Path,
+        filename: str,
+        caption: str,
+        *,
+        is_video: bool,
+    ):
+        if not self.telegram.is_connected():
+            raise RuntimeError("Telegram MTProto client is not connected.")
+
+        if not path.exists():
+            raise RuntimeError(f"File does not exist: {path}")
+
+        log.info(
+            "Uploading via Telethon MTProto: %s (%s bytes, document=%s)",
+            filename,
+            path.stat().st_size,
+            not is_video,
+        )
         await self.telegram.send_file(
             chat_id,
             str(path),
-            caption=filename,
-            force_document=not supports_streaming,
-            supports_streaming=supports_streaming,
+            caption=caption,
+            force_document=not is_video,
+            supports_streaming=is_video,
         )
 
-    async def _status(self, job: Job, text: str):
-        try:
-            await self.telegram.send_message(job.chat_id, text)
-            log.info(
-                "job=%s status_sent chat_id=%s text=%s",
-                job.job_id,
-                job.chat_id,
-                text.replace("\n", " ")[:240],
-            )
-        except Exception:
-            log.exception("job=%s could not send Telegram status", job.job_id)
+    # ---------- status / utilities ----------
 
-    @staticmethod
-    def _is_terabox_url(value: str) -> bool:
+    async def _status(
+        self,
+        job: dict,
+        task: QueueTask,
+        text: str,
+        *,
+        progress: int | None = None,
+        include_cancel_button: bool = True,
+    ):
+        if progress is not None:
+            job["progress"] = max(0, min(100, int(progress)))
+        job["statusText"] = text
+        job["logs"].append(
+            f"[{datetime.now().strftime('%H:%M:%S')}] {text.replace(chr(10), ' ')[:300]}"
+        )
+        self._save_jobs()
+
+        if not self.telegram.is_connected():
+            return
+
+        buttons = (
+            [[Button.inline("🛑 Cancel", data=f"cancel:{task.task_id}".encode())]]
+            if include_cancel_button
+            else None
+        )
+
         try:
-            host = (urlparse(value.strip()).hostname or "").lower()
-        except ValueError:
-            return False
-        return host in TERABOX_HOSTS or host.endswith(".terabox.com")
+            message_id = int(job.get("statusMessageId") or 0)
+            if message_id:
+                await self.telegram.edit_message(
+                    task.chat_id,
+                    message_id,
+                    text,
+                    buttons=buttons,
+                )
+            else:
+                message = await self.telegram.send_message(
+                    task.chat_id,
+                    text,
+                    buttons=buttons,
+                )
+                job["statusMessageId"] = int(message.id)
+                self._save_jobs()
+        except Exception as exc:
+            log.debug("Could not update status message for %s: %s", job.get("id"), exc)
+
+    def _check_cancel(self, task: QueueTask) -> None:
+        if task.cancel_requested:
+            raise RuntimeError("Download cancelled by user")
 
     @staticmethod
     def _compact_error(exc: Exception) -> str:
-        text = str(exc).strip().replace("\n", " ")
-        return text[:800] or exc.__class__.__name__
+        value = str(exc).strip().replace("\n", " ")
+        return value[:800] or exc.__class__.__name__
 
     @staticmethod
-    def _safe_filename(value: str) -> str:
-        clean = Path(value.replace("\\", "/")).name.strip()
-        clean = "".join(
-            char if char.isprintable() and char not in "\x00\r\n" else "_"
-            for char in clean
-        )
-        return clean[:240] or "terabox-file"
+    def _cleanup_job_dir(job_dir: Path, unpack_dir: Path) -> None:
+        for directory in (job_dir, unpack_dir):
+            try:
+                shutil.rmtree(directory, ignore_errors=True)
+            except Exception:
+                pass
+
+        active_dir = DOWNLOADS_DIR / "active"
+        try:
+            if active_dir.exists() and not any(active_dir.iterdir()):
+                active_dir.rmdir()
+        except OSError:
+            pass
 
 
 app = FastAPI(title="TeraBox Oracle VPS Worker")
@@ -598,11 +1575,13 @@ async def health():
     browser_ready = bool(worker.resolver.browser)
     telegram_ready = worker.telegram.is_connected()
     return {
-        "status": "ok" if browser_ready else "starting",
-        "queue_size": worker.queue.qsize(),
+        "status": "ok" if browser_ready and telegram_ready else "starting",
+        "queue_size": worker._queued_count(),
         "browser": browser_ready,
         "telegram_connected": telegram_ready,
         "telegram_authorization_in_progress": bool(
             worker.telegram_task and not worker.telegram_task.done()
         ),
+        "active_task": worker.active_task.task_id[:8] if worker.active_task else None,
+        "size_inspection": len(worker.size_inspection_queue) + (1 if worker.inspecting_task else 0),
     }
