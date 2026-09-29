@@ -6,7 +6,7 @@ services:
     env_file:
       - .env
     ports:
-      - "18080:18080"
+      - "127.0.0.1:18080:18080"
     shm_size: "1gb"
     init: true
     security_opt:
