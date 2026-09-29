@@ -574,7 +574,7 @@ class TeraBoxBrowserResolver:
                       bodyText: (document.body?.innerText || '').slice(0, 1200),
                       resourceUrls: performance.getEntriesByType('resource')
                         .map(x => x.name)
-                        .filter(x => /terabox|download|shorturl|share\//i.test(x))
+                        .filter(x => /terabox|download|shorturl|share\\//i.test(x))
                         .slice(-80)
                     })
                     """
