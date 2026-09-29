@@ -144,23 +144,28 @@ async def download_m3u8_stream(
             step = 25
             empty_streak = 0
 
+            # Preserve the complete signed query from the browser-exposed
+            # stream URL while changing only the timeline position. In
+            # particular, this keeps jsToken and any other browser-issued
+            # parameters that are required for later HLS windows.
+            base_query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+            base_query.setdefault("app_id", "250528")
+            base_query.setdefault("web", "1")
+            base_query.setdefault("channel", "dubox")
+            base_query.setdefault("clienttype", "0")
+            base_query.setdefault("shareid", effective_share_id)
+            base_query.setdefault("uk", effective_uk)
+            base_query.setdefault("fid", effective_fid)
+            base_query.setdefault("sign", effective_sign)
+            base_query.setdefault("timestamp", effective_timestamp)
+            base_query.setdefault("type", "M3U8_AUTO_480")
+            base_query.setdefault("esl", "1")
+            base_query.setdefault("isplayer", "1")
+            base_query.setdefault("ehps", "1")
+
             for t in range(step, max_scan_time + 1, step):
-                time_query = {
-                    "app_id": "250528",
-                    "web": "1",
-                    "channel": "dubox",
-                    "clienttype": "0",
-                    "shareid": effective_share_id,
-                    "uk": effective_uk,
-                    "fid": effective_fid,
-                    "sign": effective_sign,
-                    "timestamp": effective_timestamp,
-                    "type": "M3U8_AUTO_480",
-                    "time": str(t),
-                    "esl": "1",
-                    "isplayer": "1",
-                    "ehps": "1",
-                }
+                time_query = dict(base_query)
+                time_query["time"] = str(t)
                 time_url = "https://www.terabox.app/share/streaming?" + urlencode(time_query)
 
                 try:
