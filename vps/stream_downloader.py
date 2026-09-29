@@ -201,6 +201,9 @@ async def download_m3u8_stream(
             raise RuntimeError("M3U8 playlist contained no video segments.")
 
         temp_ts = output_path.with_suffix(output_path.suffix + ".temp.ts")
+        temp_output = output_path.with_name(
+            f"{output_path.stem}.remux{output_path.suffix or '.mp4'}"
+        )
         segment_dir = output_path.parent / f"{output_path.stem}.segments"
         total_bytes = 0
 
@@ -287,9 +290,6 @@ async def download_m3u8_stream(
             ffmpeg = (
                 os.getenv("FFMPEG_PATH", "").strip()
                 or "ffmpeg"
-            )
-            temp_output = output_path.with_name(
-                f"{output_path.stem}.remux{output_path.suffix or '.mp4'}"
             )
             process = await asyncio.create_subprocess_exec(
                 ffmpeg,
