@@ -14,6 +14,7 @@ jobs:
   deploy:
     name: Deploy to Oracle VPS
     runs-on: ubuntu-latest
+    timeout-minutes: 35
 
     steps:
       - name: Deploy latest main to Oracle
@@ -24,10 +25,11 @@ jobs:
           key: ${{ secrets.ORACLE_SSH_KEY }}
           command_timeout: 30m
           script: |
-            set -e
+            set -euo pipefail
 
             APP_DIR="${HOME}/terabox-telegram-bot"
 
+            echo "==> Checking Oracle workspace"
             if [ ! -d "${APP_DIR}/.git" ]; then
               echo "Repository is missing at ${APP_DIR}"
               exit 1
@@ -35,14 +37,45 @@ jobs:
 
             cd "${APP_DIR}"
 
-            echo "Updating repository..."
+            echo "==> Updating repository"
             git fetch origin main
             git reset --hard origin/main
 
-            echo "Rebuilding and restarting Oracle worker..."
+            echo "==> Deployed commit"
+            git rev-parse --short HEAD
+            git log -1 --pretty=format:'%H%n%s%n%ci'
+            echo
+
+            echo "==> Rebuilding Oracle worker"
             docker compose -f vps/docker-compose.yml up -d --build --remove-orphans
 
-            echo "Checking container status..."
+            echo "==> Container status"
             docker compose -f vps/docker-compose.yml ps
 
-            echo "Deployment complete."
+            echo "==> Waiting for worker startup"
+            healthy=0
+            for i in $(seq 1 24); do
+              if curl -fsS --max-time 3 http://127.0.0.1:18080/health; then
+                echo
+                healthy=1
+                break
+              fi
+              sleep 5
+            done
+
+            if [ "${healthy}" -ne 1 ]; then
+              echo "ERROR: Oracle worker health check failed."
+              echo "==> Recent worker logs"
+              docker compose -f vps/docker-compose.yml logs --tail=120
+              exit 1
+            fi
+
+            echo "==> Worker health check passed"
+
+            echo "==> Final container status"
+            docker compose -f vps/docker-compose.yml ps
+
+            echo "==> Recent worker logs"
+            docker compose -f vps/docker-compose.yml logs --tail=100
+
+            echo "==> Oracle deployment successful"
