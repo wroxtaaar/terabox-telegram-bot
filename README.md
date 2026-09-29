@@ -61,3 +61,28 @@ Telethon is used for outbound delivery because it uses Telegram's MTProto transp
 - Telegram webhook registration: implemented.
 - Direct anonymous delivery: supported only when TeraBox actually returns a usable direct URL.
 - Fallback streaming/download path: not enabled yet.
+
+
+## Docker
+
+The repository is Docker-ready for local testing and Render deployment. It uses the official Python 3.12 slim image to keep the runtime small while avoiding Alpine compatibility tradeoffs.
+
+### Local Docker test
+
+Create a .env file from .env.example and fill in the Telegram credentials. Then run:
+
+    docker compose build
+    docker compose up
+
+Health check: http://localhost:10000/health
+
+For a one-off container:
+
+    docker build -t terabox-telegram-bot .
+    docker run --rm --env-file .env -p 10000:10000 terabox-telegram-bot
+
+### Render
+
+Set Render to use Docker for this repository. Render will build the included Dockerfile; no Python build/start commands are needed.
+
+Required environment variables remain BOT_TOKEN, API_ID, and API_HASH. For the Telegram webhook, PUBLIC_BASE_URL must be the public Render HTTPS URL, for example https://your-service.onrender.com.
