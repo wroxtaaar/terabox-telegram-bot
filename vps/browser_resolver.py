@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import tempfile
@@ -34,6 +35,8 @@ TERABOX_HOSTS = {
 }
 
 APP_ID = "250528"
+
+log = logging.getLogger("terabox-vps-worker")
 
 STREAM_VIDEO_EXTENSIONS = {
     ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v",
