@@ -501,29 +501,28 @@ async def _resolve_via_edge_gateway(session, share_url):
     if not endpoint:
         raise RuntimeError("Edge resolver is disabled.")
 
-    try:
-        async with session.get(
-            endpoint,
-            params={"url": share_url},
-            headers={
-                "User-Agent": UA,
-                "Accept": "application/json",
-            },
-            allow_redirects=True,
-        ) as response:
-            body = await response.text()
-            if response.status >= 400:
-                raise RuntimeError(
-                    f"Edge resolver HTTP {response.status}: {body[:200]}"
-                )
-            try:
-                data = json.loads(body)
-            except json.JSONDecodeError as exc:
-                raise RuntimeError(
-                    "Edge resolver returned non-JSON."
-                ) from exc
+    async with session.get(
+        endpoint,
+        params={"url": share_url},
+        headers={
+            "User-Agent": UA,
+            "Accept": "application/json",
+        },
+        allow_redirects=True,
+    ) as response:
+        body = await response.text()
+        if response.status >= 400:
+            raise RuntimeError(
+                f"Edge resolver HTTP {response.status}: {body[:200]}"
+            )
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                "Edge resolver returned non-JSON."
+            ) from exc
 
-        if not isinstance(data, dict) or not data.get("success"):
+    if not isinstance(data, dict) or not data.get("success"):
             raise RuntimeError(
                 f"Edge resolver failed: "
                 f"{data.get('error') if isinstance(data, dict) else 'invalid response'}"
