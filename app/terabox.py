@@ -492,90 +492,96 @@ def _parse_gateway_size(value) -> int:
         return 0
 
 
-async def _resolve_via_edge_gateway(session, share_url):
-    """Use a Cloudflare-edge resolver when TeraBox blocks Render's IP."""
+async def _resolve_via_remote_service(session, share_url):
+    """Ask the dedicated resolver service to resolve the TeraBox share."""
     endpoint = os.getenv(
-        "TERABOX_EDGE_RESOLVER_URL",
-        "https://terabox-worker.robinkumarshakya103.workers.dev/api",
+        "TERABOX_RESOLVER_URL",
+        "https://terabox-resolver-lc2i.onrender.com/resolve",
     ).strip()
+    secret = os.getenv("TERABOX_RESOLVER_SECRET", "").strip()
+
     if not endpoint:
-        raise RuntimeError("Edge resolver is disabled.")
+        raise RuntimeError("Remote resolver is disabled.")
+
+    headers = {
+        "User-Agent": UA,
+        "Accept": "application/json",
+    }
+    if secret:
+        headers["X-Resolver-Secret"] = secret
 
     async with session.get(
         endpoint,
         params={"url": share_url},
-        headers={
-            "User-Agent": UA,
-            "Accept": "application/json",
-        },
+        headers=headers,
         allow_redirects=True,
     ) as response:
         body = await response.text()
         if response.status >= 400:
             raise RuntimeError(
-                f"Edge resolver HTTP {response.status}: {body[:200]}"
+                f"Remote resolver HTTP {response.status}: {body[:240]}"
             )
         try:
             data = json.loads(body)
         except json.JSONDecodeError as exc:
-            raise RuntimeError("Edge resolver returned non-JSON.") from exc
+            raise RuntimeError(
+                "Remote resolver returned non-JSON."
+            ) from exc
 
     if not isinstance(data, dict) or not data.get("success"):
         raise RuntimeError(
-            "Edge resolver failed: "
+            "Remote resolver failed: "
             f"{data.get('error') if isinstance(data, dict) else 'invalid response'}"
         )
 
+    direct_url = str(data.get("direct_url") or "").strip()
+    if not direct_url:
+        raise RuntimeError("Remote resolver returned no direct URL.")
+
+    row = {
+        "file_name": str(data.get("file_name") or "").strip(),
+        "size": _parse_gateway_size(data.get("size")),
+        "fs_id": str(data.get("fs_id") or ""),
+        "path": "",
+        "is_dir": False,
+        "direct_url": direct_url,
+        "thumbnail": str(data.get("thumbnail") or ""),
+    }
+
     files = data.get("files")
-    if not isinstance(files, list) or not files:
-        raise RuntimeError("Edge resolver returned no files.")
-
     normalized = []
-    for item in files:
-        if not isinstance(item, dict):
-            continue
-
-        file_name = str(
-            item.get("file_name")
-            or item.get("filename")
-            or item.get("name")
-            or ""
-        ).strip()
-
-        proxied = str(
-            item.get("download_url")
-            or item.get("original_download_url")
-            or ""
-        ).strip()
-        if not proxied:
-            continue
-
-        normalized.append(
-            {
-                "file_name": file_name,
+    if isinstance(files, list):
+        for item in files:
+            if not isinstance(item, dict):
+                continue
+            normalized.append({
+                "file_name": str(
+                    item.get("file_name")
+                    or item.get("filename")
+                    or item.get("name")
+                    or ""
+                ).strip(),
                 "size": _parse_gateway_size(item.get("size")),
                 "fs_id": str(
-                    item.get("fid")
-                    or item.get("fs_id")
+                    item.get("fs_id")
+                    or item.get("fid")
                     or ""
                 ),
                 "path": str(item.get("path") or ""),
-                "is_dir": False,
-                "direct_url": proxied,
+                "is_dir": bool(item.get("is_dir", False)),
+                "direct_url": str(
+                    item.get("direct_url")
+                    or item.get("download_url")
+                    or ""
+                ).strip(),
                 "thumbnail": str(
                     item.get("thumbnail")
                     or item.get("thumb")
                     or ""
                 ),
-            }
-        )
+            })
 
-    if not normalized:
-        raise RuntimeError(
-            "Edge resolver returned no downloadable file URLs."
-        )
-
-    return normalized[0], normalized
+    return row, (normalized or [row])
 
 
 async def _origins(session, share_url):
@@ -755,21 +761,20 @@ async def resolve_terabox_url(url: str) -> dict:
                     exc,
                 )
 
-        # Render's datacenter IP can be challenged by TeraBox before
-        # the browser token is exposed. Try a separate edge resolver as the
-        # final fallback so the Telegram bot itself remains lightweight.
+        # The Telegram bot runs on Render Singapore. If TeraBox blocks that
+        # datacenter, hand the share to the separate resolver service.
         try:
-            row, gateway_rows = await _resolve_via_edge_gateway(
+            row, resolver_rows = await _resolve_via_remote_service(
                 session, url
             )
             log.info(
-                "TeraBox edge gateway resolved %s",
+                "Remote TeraBox resolver returned %s",
                 row["file_name"],
             )
             return _result(
                 surl,
                 row,
-                gateway_rows,
+                resolver_rows,
             )
         except (
             aiohttp.ClientError,
@@ -778,7 +783,7 @@ async def resolve_terabox_url(url: str) -> dict:
         ) as exc:
             last = exc
             log.info(
-                "TeraBox edge gateway failed: %s",
+                "Remote TeraBox resolver failed: %s",
                 exc,
             )
 
