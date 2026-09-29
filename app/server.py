@@ -62,7 +62,7 @@ async def handle_update(update,tg):
     await tg.send_text(chat_id,"Resolving the TeraBox link…")
     try:
         resolved=await resolve_terabox_url(url)
-        await tg.send_external_file(chat_id,resolved["direct_url"],caption=resolved.get("file_name"))
+        await tg.send_external_file(\n            chat_id, resolved["direct_url"], caption=resolved.get("file_name"),\n            filename=resolved.get("file_name"), size=resolved.get("size", 0)\n        )
     except Exception as exc:
         log.exception("TeraBox delivery failed")
         await tg.send_text(chat_id,f"I couldn't deliver that link: {exc}")
