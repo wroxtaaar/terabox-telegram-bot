@@ -270,15 +270,34 @@ class Worker:
                 ) as response:
                     response.raise_for_status()
                     content_length = int(response.headers.get("Content-Length") or 0)
+                    content_type = (
+                        response.headers.get("Content-Type")
+                        or ""
+                    ).split(";", 1)[0].strip().lower()
                     declared = max(expected_size, content_length)
 
                     log.info(
-                        "job=%s downloading HTTP=%s expected_size=%s content_length=%s",
+                        "job=%s downloading HTTP=%s expected_size=%s content_length=%s content_type=%s final_url=%s",
                         job.job_id,
                         response.status,
                         expected_size,
                         content_length,
+                        content_type or "<missing>",
+                        response.url,
                     )
+
+                    blocked_types = {
+                        "text/html",
+                        "text/plain",
+                        "application/json",
+                        "application/xml",
+                        "text/xml",
+                    }
+                    if content_type in blocked_types:
+                        raise RuntimeError(
+                            "Resolved URL returned a non-file response "
+                            f"({content_type}); refusing to upload it."
+                        )
 
                     with tmp:
                         async for chunk in response.content.iter_chunked(1024 * 1024):
@@ -323,6 +342,13 @@ class Worker:
         if total <= 0:
             path.unlink(missing_ok=True)
             raise RuntimeError("TeraBox direct URL returned an empty file.")
+
+        if expected_size and total != expected_size:
+            path.unlink(missing_ok=True)
+            raise RuntimeError(
+                f"TeraBox download size mismatch: expected {expected_size} bytes, "
+                f"received {total} bytes."
+            )
 
         return path, total
 
