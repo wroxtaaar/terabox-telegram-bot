@@ -189,7 +189,15 @@ async def download_m3u8_stream(
             raise RuntimeError("M3U8 playlist contained no video segments.")
 
         temp_ts = output_path.with_suffix(output_path.suffix + ".temp.ts")
+        temp_output = output_path.with_suffix(output_path.suffix + ".remux.tmp")
         total_bytes = 0
+
+        log = __import__("logging").getLogger("terabox-vps-worker")
+        log.info(
+            "HLS playlist discovered %s unique segment(s) for %s",
+            len(indices),
+            output_path.name,
+        )
 
         try:
             with temp_ts.open("wb") as output:
@@ -223,6 +231,7 @@ async def download_m3u8_stream(
                 os.getenv("FFMPEG_PATH", "").strip()
                 or "ffmpeg"
             )
+            temp_output.unlink(missing_ok=True)
             process = await asyncio.create_subprocess_exec(
                 ffmpeg,
                 "-hide_banner",
@@ -233,7 +242,7 @@ async def download_m3u8_stream(
                 str(temp_ts),
                 "-c",
                 "copy",
-                str(output_path),
+                str(temp_output),
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -246,8 +255,14 @@ async def download_m3u8_stream(
                     + (f": {error_text[-1200:]}" if error_text else ".")
                 )
 
+            if not temp_output.exists() or temp_output.stat().st_size <= 0:
+                raise RuntimeError("FFmpeg reported success but produced no output file.")
+
+            temp_output.replace(output_path)
+
         finally:
             temp_ts.unlink(missing_ok=True)
+            temp_output.unlink(missing_ok=True)
 
     size = output_path.stat().st_size if output_path.exists() else 0
     if size <= 0:
