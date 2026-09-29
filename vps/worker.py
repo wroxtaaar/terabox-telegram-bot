@@ -198,9 +198,12 @@ class Worker:
             size = int(resolved.get("size") or 0)
             direct_url = str(resolved.get("direct_url") or "").strip()
             stream_url = str(resolved.get("stream_url") or "").strip()
+            browser_download_path = str(
+                resolved.get("browser_download_path") or ""
+            ).strip()
             download_mode = str(resolved.get("download_mode") or "").strip()
 
-            if not direct_url and not stream_url:
+            if not direct_url and not stream_url and not browser_download_path:
                 raise RuntimeError(
                     "Resolver returned neither a direct download URL nor an HLS stream URL."
                 )
@@ -219,7 +222,28 @@ class Worker:
                 f"✅ Resolved: {filename}\n⬇️ Starting download…",
             )
 
-            if stream_url and not direct_url:
+            if browser_download_path:
+                browser_path = Path(browser_download_path)
+                if not browser_path.exists():
+                    raise RuntimeError(
+                        "Chromium reported a downloaded file, but the temporary file is missing."
+                    )
+                temp_path = browser_path
+                downloaded_size = browser_path.stat().st_size
+                if downloaded_size <= 0:
+                    raise RuntimeError("Chromium downloaded an empty file.")
+                if size and downloaded_size != size:
+                    raise RuntimeError(
+                        f"Browser download size mismatch: expected {size} bytes, "
+                        f"received {downloaded_size} bytes."
+                    )
+                log.info(
+                    "job=%s using native browser download file=%s size=%s",
+                    job.job_id,
+                    filename,
+                    downloaded_size,
+                )
+            elif stream_url and not direct_url:
                 temp_path, downloaded_size = await self._download_stream(
                     job,
                     stream_url,
