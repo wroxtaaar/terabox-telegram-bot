@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import heapq
 import json
 import logging
 import math
@@ -249,7 +250,9 @@ class Worker:
         self.resolver = TeraBoxBrowserResolver(max_concurrent=1)
 
         self.size_inspection_queue: list[QueueTask] = []
-        self.download_queue: list[QueueTask] = []
+        # Min-heap ordered by file size, then enqueue time, then task id.
+        # Unknown-size tasks are kept in the inspection queue until sized.
+        self.download_queue: list[tuple[int, float, str, QueueTask]] = []
         self.active_task: QueueTask | None = None
         self.inspecting_task: QueueTask | None = None
         self.size_event = asyncio.Event()
@@ -330,17 +333,25 @@ class Worker:
         return self._queued_count() + (1 if self.active_task else 0)
 
     @staticmethod
-    def _sort_key(task: QueueTask) -> tuple[int, float]:
+    def _sort_key(task: QueueTask) -> tuple[int, float, str]:
         return (
             task.size_bytes if task.size_bytes is not None else 2**63 - 1,
             task.queued_at,
+            task.task_id,
         )
+
+    @staticmethod
+    def _heap_item(task: QueueTask) -> tuple[int, float, str, QueueTask]:
+        size = task.size_bytes if task.size_bytes is not None else 2**63 - 1
+        return (size, task.queued_at, task.task_id, task)
+
+    def _push_download_task(self, task: QueueTask) -> None:
+        heapq.heappush(self.download_queue, self._heap_item(task))
 
     def _next_download_task(self) -> QueueTask | None:
         if not self.download_queue:
             return None
-        self.download_queue.sort(key=self._sort_key)
-        return self.download_queue.pop(0)
+        return heapq.heappop(self.download_queue)[3]
 
     def _find_task(self, task_id: str) -> QueueTask | None:
         if self.active_task and self.active_task.task_id == task_id:
@@ -348,18 +359,23 @@ class Worker:
         for task in self.size_inspection_queue:
             if task.task_id == task_id:
                 return task
-        for task in self.download_queue:
+        for _, _, _, task in self.download_queue:
             if task.task_id == task_id:
                 return task
         return None
 
     def _remove_task(self, task: QueueTask) -> None:
-        for queue in (self.size_inspection_queue, self.download_queue):
-            try:
-                queue.remove(task)
+        try:
+            self.size_inspection_queue.remove(task)
+            return
+        except ValueError:
+            pass
+
+        for index, (_, _, _, queued_task) in enumerate(self.download_queue):
+            if queued_task is task:
+                self.download_queue.pop(index)
+                heapq.heapify(self.download_queue)
                 return
-            except ValueError:
-                continue
 
     async def _request_cancel(self, task: QueueTask) -> bool:
         if task.cancel_requested:
@@ -635,7 +651,10 @@ class Worker:
             else:
                 candidates = [
                     item
-                    for item in self.size_inspection_queue + self.download_queue
+                    for item in (
+                        self.size_inspection_queue
+                        + [queued_task for _, _, _, queued_task in self.download_queue]
+                    )
                     if item.chat_id == chat_id
                 ]
                 if candidates:
@@ -712,7 +731,7 @@ class Worker:
             if self.size_inspection_queue
             else "Empty"
         )
-        ready = sorted(self.download_queue, key=self._sort_key)
+        ready = sorted((queued_task for _, _, _, queued_task in self.download_queue), key=self._sort_key)
         queue_lines = (
             "\n".join(self._queue_task_line(i + 1, task) for i, task in enumerate(ready))
             if ready
@@ -812,7 +831,7 @@ class Worker:
                     self.inspecting_task = None
 
                 if not task.cancel_requested:
-                    self.download_queue.append(task)
+                    self._push_download_task(task)
                     self.download_event.set()
 
     # ---------- download queue ----------
@@ -823,6 +842,8 @@ class Worker:
             self.download_event.clear()
 
             while self.download_queue and not self.stop_event.is_set():
+                if self.inspecting_task or self.size_inspection_queue:
+                    break
                 task = self._next_download_task()
                 if not task:
                     break
