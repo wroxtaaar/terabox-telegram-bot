@@ -14,7 +14,8 @@ from urllib.parse import urlparse
 import aiohttp
 from fastapi import FastAPI
 from telethon import TelegramClient, events
-from telethon.sessions import StringSession
+from telethon.errors import FloodWaitError
+from telethon.sessions import SQLiteSession
 
 from .browser_resolver import TeraBoxBrowserResolver
 from .stream_downloader import download_m3u8_stream
@@ -71,8 +72,18 @@ class Worker:
 
         self.queue: asyncio.Queue[Job] = asyncio.Queue()
         self.resolver = TeraBoxBrowserResolver(max_concurrent=1)
-        self.telegram = TelegramClient(StringSession(), self.api_id, self.api_hash)
+
+        # Persist MTProto authorization across Docker container restarts.
+        self.session_dir = Path(os.getenv("TELETHON_SESSION_DIR", "/worker/data"))
+        self.session_dir.mkdir(parents=True, exist_ok=True)
+        self.session_path = str(self.session_dir / "terabox_bot")
+        self.telegram = TelegramClient(
+            SQLiteSession(self.session_path),
+            self.api_id,
+            self.api_hash,
+        )
         self.task: asyncio.Task | None = None
+        self.telegram_task: asyncio.Task | None = None
 
     async def start(self):
         log.info("Starting Chromium resolver...")
@@ -81,23 +92,59 @@ class Worker:
         log.info("Removing any legacy Telegram Bot API webhook...")
         await self._delete_bot_api_webhook()
 
-        log.info("Starting Telegram MTProto bot client on VPS...")
-        await self.telegram.start(bot_token=self.bot_token)
-
-        self.telegram.add_event_handler(
-            self._on_message,
-            events.NewMessage(incoming=True),
-        )
-
-        me = await self.telegram.get_me()
-        log.info(
-            "Telegram bot connected: username=@%s id=%s",
-            getattr(me, "username", None),
-            getattr(me, "id", None),
+        # Telegram authorization can temporarily return FloodWait. Do not
+        # block FastAPI startup or cause Hypercorn to restart the container.
+        self.telegram_task = asyncio.create_task(
+            self._connect_telegram_with_retry()
         )
 
         self.task = asyncio.create_task(self._queue_loop())
-        log.info("VPS worker ready; Telegram intake is running directly on Oracle.")
+        log.info(
+            "VPS worker started; Telegram authorization is running in the background."
+        )
+
+    async def _connect_telegram_with_retry(self):
+        registered = False
+
+        while True:
+            try:
+                log.info("Starting Telegram MTProto bot client on VPS...")
+                await self.telegram.start(bot_token=self.bot_token)
+
+                if not registered:
+                    self.telegram.add_event_handler(
+                        self._on_message,
+                        events.NewMessage(incoming=True),
+                    )
+                    registered = True
+
+                me = await self.telegram.get_me()
+                log.info(
+                    "Telegram bot connected: username=@%s id=%s",
+                    getattr(me, "username", None),
+                    getattr(me, "id", None),
+                )
+                log.info(
+                    "VPS worker ready; Telegram intake is running directly on Oracle."
+                )
+                return
+            except FloodWaitError as exc:
+                wait_seconds = max(1, int(exc.seconds))
+                log.warning(
+                    "Telegram requested FloodWait=%ss during bot authorization. "
+                    "Keeping the worker alive and retrying after the wait.",
+                    wait_seconds,
+                )
+                if self.telegram.is_connected():
+                    await self.telegram.disconnect()
+                await asyncio.sleep(wait_seconds)
+            except Exception:
+                log.exception(
+                    "Telegram MTProto connection failed; retrying in 30 seconds."
+                )
+                if self.telegram.is_connected():
+                    await self.telegram.disconnect()
+                await asyncio.sleep(30)
 
     async def _delete_bot_api_webhook(self):
         timeout = aiohttp.ClientTimeout(total=15, connect=8)
@@ -113,13 +160,16 @@ class Worker:
         log.info("Telegram Bot API webhook removed; Oracle will receive updates via MTProto.")
 
     async def stop(self):
-        if self.task:
-            self.task.cancel()
-            try:
-                await self.task
-            except asyncio.CancelledError:
-                pass
-            self.task = None
+        for task in (self.task, self.telegram_task):
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+        self.task = None
+        self.telegram_task = None
 
         if self.telegram.is_connected():
             await self.telegram.disconnect()
@@ -531,9 +581,14 @@ async def health():
     if not worker:
         return {"status": "starting"}
 
+    browser_ready = bool(worker.resolver.browser)
+    telegram_ready = worker.telegram.is_connected()
     return {
-        "status": "ok",
+        "status": "ok" if browser_ready else "starting",
         "queue_size": worker.queue.qsize(),
-        "browser": bool(worker.resolver.browser),
-        "telegram_connected": worker.telegram.is_connected(),
+        "browser": browser_ready,
+        "telegram_connected": telegram_ready,
+        "telegram_authorization_in_progress": bool(
+            worker.telegram_task and not worker.telegram_task.done()
+        ),
     }
