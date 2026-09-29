@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import tempfile
 import time
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote_plus, urlparse
 
@@ -539,6 +542,34 @@ class TeraBoxBrowserResolver:
                         direct = row
                         break
 
+            # Fallback: use the actual TeraBox browser UI/download session.
+            # This catches variants where the web app can download the file but
+            # /share/download does not expose a usable dlink.
+            browser_download_path = ""
+            if not direct and file_rows:
+                try:
+                    browser_result, browser_name = await self._browser_native_download(
+                        page=page,
+                        file_rows=file_rows,
+                        fallback_filename=str(
+                            file_rows[0].get("file_name") or "terabox-file"
+                        ),
+                        expected_size=int(file_rows[0].get("size") or 0),
+                    )
+                    if browser_result:
+                        if browser_result.startswith("/"):
+                            browser_download_path = browser_result
+                            selected_name = browser_name
+                        else:
+                            file_rows[0]["direct_url"] = browser_result
+                            file_rows[0]["file_name"] = browser_name or file_rows[0].get("file_name")
+                            direct = file_rows[0]
+                except Exception as browser_err:
+                    print(
+                        f"browser fallback failed: {type(browser_err).__name__}: {browser_err}",
+                        flush=True,
+                    )
+
             # Fallback: the working reference implementation can stream a
             # video through TeraBox's HLS endpoint even when /share/download
             # does not return a normal dlink.
@@ -613,8 +644,23 @@ class TeraBoxBrowserResolver:
                     "Chromium loaded the TeraBox page but no direct download or stream URL was exposed."
                 )
 
-            selected = direct or stream
-            download_mode = "direct" if direct else "stream"
+            if browser_download_path:
+                selected = next(
+                    (
+                        row for row in file_rows
+                        if row.get("file_name") == selected_name
+                    ),
+                    file_rows[0],
+                )
+                selected["file_name"] = selected_name or selected.get("file_name")
+                selected["size"] = int(
+                    os.path.getsize(browser_download_path)
+                )
+                selected["browser_download_path"] = browser_download_path
+                download_mode = "browser"
+            else:
+                selected = direct or stream
+                download_mode = "direct" if direct else "stream"
 
             print(
                 f"resolve success file={selected.get('file_name') or '<unknown>'} "
@@ -629,6 +675,7 @@ class TeraBoxBrowserResolver:
                 "fs_id": selected.get("fs_id") or "",
                 "direct_url": selected.get("direct_url") or "",
                 "stream_url": selected.get("stream_url") or "",
+                "browser_download_path": selected.get("browser_download_path") or "",
                 "download_mode": download_mode,
                 "thumbnail": selected.get("thumbnail") or "",
                 "sign": selected.get("sign") or sign,
@@ -650,6 +697,201 @@ class TeraBoxBrowserResolver:
                 page.remove_listener("response", capture)
             except Exception:
                 pass
+
+    async def _browser_native_download(
+        self,
+        *,
+        page: Page,
+        file_rows: list[dict[str, Any]],
+        fallback_filename: str,
+        expected_size: int = 0,
+    ) -> tuple[str, str]:
+        """
+        Last-resort browser download fallback adapted from the reference
+        implementation. This uses the actual TeraBox UI/session instead of
+        reconstructing its signed CDN request outside Chromium.
+        """
+        download_holder: dict[str, Any] = {}
+        request_holder: dict[str, str] = {}
+
+        async def on_download(download):
+            if "download" not in download_holder:
+                download_holder["download"] = download
+
+        def on_request(request):
+            request_url = request.url
+            if request_holder.get("url"):
+                return
+
+            is_terabox_cdn = any(
+                marker in request_url.lower()
+                for marker in (
+                    "terabox",
+                    "1024tera",
+                    "baidupcs",
+                    "bcebos",
+                    "teraboxcdn",
+                    "terashare",
+                    "nephobox",
+                    "4funbox",
+                )
+            )
+            if not is_terabox_cdn:
+                return
+
+            parsed = urlparse(request_url)
+            path_lower = parsed.path.lower()
+            if any(
+                path_lower.endswith(ext)
+                for ext in (".js", ".css", ".png", ".ico", ".html", ".svg", ".woff", ".woff2")
+            ):
+                return
+
+            if "/file/" in path_lower or "download" in path_lower:
+                request_holder["url"] = request_url
+
+        page.on("download", on_download)
+        page.on("request", on_request)
+
+        try:
+            # Select a real file when a checkbox UI is present. We deliberately
+            # do not use "Select All" because the worker currently handles one
+            # resolved file at a time.
+            checkboxes = page.locator("input[type='checkbox']")
+            try:
+                count = await checkboxes.count()
+                if count > 1:
+                    await checkboxes.nth(1).check(force=True)
+                    await page.wait_for_timeout(300)
+            except Exception:
+                pass
+
+            selectors = (
+                ".download-btn:visible",
+                "button:has-text('Download'):visible",
+                "a:has-text('Download'):visible",
+                "span:has-text('Download'):visible",
+            )
+
+            button = None
+            for selector in selectors:
+                try:
+                    locator = page.locator(selector)
+                    if await locator.count() > 0 and await locator.first.is_visible():
+                        button = locator.first
+                        break
+                except Exception:
+                    continue
+
+            if button is None:
+                try:
+                    for candidate in await page.locator("button, a").all():
+                        try:
+                            label = (await candidate.inner_text()).strip().lower()
+                            if "download" in label and await candidate.is_visible():
+                                button = candidate
+                                break
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+
+            if button is None:
+                return "", ""
+
+            await button.scroll_into_view_if_needed()
+            print("browser fallback: clicking TeraBox Download button", flush=True)
+            await button.click(timeout=30000, force=True)
+
+            # TeraBox can show a secondary "Normal/Ordinary download" button.
+            for attempt in range(40):
+                if download_holder.get("download"):
+                    break
+
+                if attempt in (3, 8, 15):
+                    for selector in (
+                        "button:has-text('Normal'):visible",
+                        "a:has-text('Normal'):visible",
+                        "button:has-text('Ordinary'):visible",
+                        "button:has-text('Download anyway'):visible",
+                        ".normal-download-btn:visible",
+                        ".download-normal:visible",
+                    ):
+                        try:
+                            modal = page.locator(selector)
+                            if await modal.count() > 0 and await modal.first.is_visible():
+                                print(
+                                    f"browser fallback: clicking secondary {selector}",
+                                    flush=True,
+                                )
+                                await modal.first.click(timeout=5000, force=True)
+                                break
+                        except Exception:
+                            continue
+
+                await page.wait_for_timeout(500)
+
+            download = download_holder.get("download")
+            if download is not None:
+                suggested = str(
+                    getattr(download, "suggested_filename", "") or fallback_filename
+                ).strip()
+                safe_name = Path(suggested.replace("\\", "/")).name.strip()
+                if not safe_name:
+                    safe_name = fallback_filename or "terabox-file"
+
+                suffix = Path(safe_name).suffix or ".bin"
+                fd, temp_name = tempfile.mkstemp(
+                    prefix="terabox-browser-",
+                    suffix=suffix,
+                    dir="/tmp",
+                )
+                os.close(fd)
+
+                try:
+                    await download.save_as(temp_name)
+                    actual_size = os.path.getsize(temp_name)
+                    if actual_size <= 2048:
+                        raise RuntimeError(
+                            f"Browser download was too small ({actual_size} bytes)."
+                        )
+                    if expected_size and actual_size != expected_size:
+                        raise RuntimeError(
+                            f"Browser download size mismatch: expected {expected_size}, "
+                            f"received {actual_size} bytes."
+                        )
+
+                    print(
+                        f"browser fallback: native download saved file={safe_name} "
+                        f"size={actual_size}",
+                        flush=True,
+                    )
+                    return temp_name, safe_name
+                except Exception:
+                    try:
+                        os.unlink(temp_name)
+                    except OSError:
+                        pass
+                    raise
+
+            # Some TeraBox variants navigate directly to a CDN request instead
+            # of exposing a Download object. Return that request only as a
+            # final URL fallback; the worker can try it with its normal checks.
+            if request_holder.get("url"):
+                print("browser fallback: captured CDN download request", flush=True)
+                return request_holder["url"], fallback_filename
+
+            return "", ""
+        finally:
+            try:
+                page.remove_listener("download", on_download)
+            except Exception:
+                pass
+            try:
+                page.remove_listener("request", on_request)
+            except Exception:
+                pass
+
 
     @staticmethod
     def _errno(data: Any) -> int:
