@@ -7,11 +7,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /worker
 
-COPY vps/requirements.txt ./requirements.txt
+COPY requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt \
     && python -m playwright install --with-deps chromium
 
-COPY vps ./vps
+COPY browser_resolver.py ./vps/browser_resolver.py
+COPY worker.py ./vps/worker.py
+COPY __init__.py ./vps/__init__.py
 
 EXPOSE 18080
 
