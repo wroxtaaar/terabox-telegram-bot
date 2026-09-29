@@ -9,6 +9,7 @@ class Settings:
     webhook_secret: str
     public_base_url: str
     port: int
+    terabox_edge_resolver_url: str
 
 def load_settings() -> Settings:
     bot_token=os.getenv("BOT_TOKEN","").strip()
@@ -24,4 +25,8 @@ def load_settings() -> Settings:
         webhook_secret=os.getenv("WEBHOOK_SECRET","").strip(),
         public_base_url=os.getenv("PUBLIC_BASE_URL","").strip().rstrip("/"),
         port=int(os.getenv("PORT","10000")),
+        terabox_edge_resolver_url=os.getenv(
+            "TERABOX_EDGE_RESOLVER_URL",
+            "https://terabox-worker.robinkumarshakya103.workers.dev/api",
+        ).strip().rstrip("/"),
     )
