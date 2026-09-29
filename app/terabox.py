@@ -518,69 +518,64 @@ async def _resolve_via_edge_gateway(session, share_url):
         try:
             data = json.loads(body)
         except json.JSONDecodeError as exc:
-            raise RuntimeError(
-                "Edge resolver returned non-JSON."
-            ) from exc
+            raise RuntimeError("Edge resolver returned non-JSON.") from exc
 
     if not isinstance(data, dict) or not data.get("success"):
-            raise RuntimeError(
-                f"Edge resolver failed: "
-                f"{data.get('error') if isinstance(data, dict) else 'invalid response'}"
-            )
+        raise RuntimeError(
+            "Edge resolver failed: "
+            f"{data.get('error') if isinstance(data, dict) else 'invalid response'}"
+        )
 
-        files = data.get("files")
-        if not isinstance(files, list) or not files:
-            raise RuntimeError("Edge resolver returned no files.")
+    files = data.get("files")
+    if not isinstance(files, list) or not files:
+        raise RuntimeError("Edge resolver returned no files.")
 
-        normalized = []
-        for item in files:
-            if not isinstance(item, dict):
-                continue
+    normalized = []
+    for item in files:
+        if not isinstance(item, dict):
+            continue
 
-            file_name = str(
-                item.get("file_name")
-                or item.get("filename")
-                or item.get("name")
-                or ""
-            ).strip()
+        file_name = str(
+            item.get("file_name")
+            or item.get("filename")
+            or item.get("name")
+            or ""
+        ).strip()
 
-            proxied = str(
-                item.get("download_url")
-                or item.get("original_download_url")
-                or ""
-            ).strip()
+        proxied = str(
+            item.get("download_url")
+            or item.get("original_download_url")
+            or ""
+        ).strip()
+        if not proxied:
+            continue
 
-            if not proxied:
-                continue
+        normalized.append(
+            {
+                "file_name": file_name,
+                "size": _parse_gateway_size(item.get("size")),
+                "fs_id": str(
+                    item.get("fid")
+                    or item.get("fs_id")
+                    or ""
+                ),
+                "path": str(item.get("path") or ""),
+                "is_dir": False,
+                "direct_url": proxied,
+                "thumbnail": str(
+                    item.get("thumbnail")
+                    or item.get("thumb")
+                    or ""
+                ),
+            }
+        )
 
-            normalized.append(
-                {
-                    "file_name": file_name,
-                    "size": _parse_gateway_size(item.get("size")),
-                    "fs_id": str(
-                        item.get("fid")
-                        or item.get("fs_id")
-                        or ""
-                    ),
-                    "path": str(item.get("path") or ""),
-                    "is_dir": False,
-                    "direct_url": proxied,
-                    "thumbnail": str(
-                        item.get("thumbnail")
-                        or item.get("thumb")
-                        or ""
-                    ),
-                }
-            )
+    if not normalized:
+        raise RuntimeError(
+            "Edge resolver returned no downloadable file URLs."
+        )
 
-        if not normalized:
-            raise RuntimeError(
-                "Edge resolver returned no downloadable file URLs."
-            )
-
-        return normalized[0], normalized
-
-
+    return normalized[0], normalized
 
 
 async def _origins(session, share_url):
