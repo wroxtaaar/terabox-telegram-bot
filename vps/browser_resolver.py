@@ -32,6 +32,24 @@ TERABOX_HOSTS = {
     "www.terasharefile.com",
     "teraboxshare.com",
     "www.teraboxshare.com",
+    "nephobox.com",
+    "www.nephobox.com",
+    "mirrobox.com",
+    "www.mirrobox.com",
+    "mirrorbox.com",
+    "www.mirrorbox.com",
+    "momerybox.com",
+    "www.momerybox.com",
+    "tibibox.com",
+    "www.tibibox.com",
+    "gibibox.com",
+    "www.gibibox.com",
+    "pebibox.com",
+    "www.pebibox.com",
+    "4funbox.com",
+    "www.4funbox.com",
+    "dubox.com",
+    "www.dubox.com",
 }
 
 APP_ID = "250528"
@@ -277,7 +295,12 @@ class TeraBoxBrowserResolver:
             await self._playwright.stop()
             self._playwright = None
 
-    async def resolve(self, share_url: str) -> dict[str, Any]:
+    async def resolve(
+        self,
+        share_url: str,
+        *,
+        allow_native_download: bool = True,
+    ) -> dict[str, Any]:
         if not is_terabox_url(share_url):
             raise ValueError("Unsupported TeraBox URL.")
 
@@ -311,7 +334,10 @@ class TeraBoxBrowserResolver:
                 for candidate in candidates:
                     try:
                         result = await self._resolve_candidate(
-                            page, share_url, candidate
+                            page,
+                            share_url,
+                            candidate,
+                            allow_native_download=allow_native_download,
                         )
                         elapsed = (time.monotonic() - started) * 1000
                         result["resolve_ms"] = round(elapsed)
@@ -330,6 +356,8 @@ class TeraBoxBrowserResolver:
         page: Page,
         original_url: str,
         surl: str,
+        *,
+        allow_native_download: bool = True,
     ) -> dict[str, Any]:
         share_page = (
             "https://www.terabox.app/sharing/link?surl=" + quote_plus(surl)
@@ -521,35 +549,83 @@ class TeraBoxBrowserResolver:
                 bool(uk),
             )
 
+            # Resolve direct download URLs for every file we can. The
+            # Studio implementation exposed the whole downloadable file list,
+            # not just the first file.
+            if js_token:
+                for row in file_rows:
+                    if row.get("is_dir") or row.get("direct_url") or not row.get("fs_id"):
+                        continue
+
+                    try:
+                        dlink = await self._browser_download(
+                            page=page,
+                            js_token=js_token,
+                            share_id=share_id,
+                            uk=uk,
+                            sign=sign or row.get("sign", ""),
+                            timestamp=timestamp or row.get("timestamp", ""),
+                            fs_id=row["fs_id"],
+                        )
+                    except Exception as exc:
+                        print(
+                            f"share/download failed fsid={row.get('fs_id')}: "
+                            f"{type(exc).__name__}: {exc}",
+                            flush=True,
+                        )
+                        dlink = ""
+
+                    if dlink:
+                        row["direct_url"] = dlink
+
             direct = next(
                 (row for row in file_rows if row.get("direct_url")),
                 None,
             )
 
-            if not direct and js_token:
+            # Build HLS URLs for every video without a direct URL. This keeps
+            # multi-file video shares downloadable even when /share/download
+            # only yields a usable URL for some files.
+            stream = None
+            if share_id and uk:
                 for row in file_rows:
-                    if row.get("is_dir") or not row.get("fs_id"):
+                    if row.get("is_dir") or row.get("direct_url") or row.get("stream_url"):
                         continue
 
-                    dlink = await self._browser_download(
-                        page=page,
-                        js_token=js_token,
+                    file_name = str(row.get("file_name") or "").lower()
+                    if not any(
+                        file_name.endswith(ext) for ext in STREAM_VIDEO_EXTENSIONS
+                    ):
+                        continue
+
+                    row_sign = row.get("sign") or sign
+                    row_timestamp = row.get("timestamp") or timestamp
+                    stream_url = _build_stream_url(
                         share_id=share_id,
                         uk=uk,
-                        sign=sign or row.get("sign", ""),
-                        timestamp=timestamp or row.get("timestamp", ""),
-                        fs_id=row["fs_id"],
+                        fs_id=str(row.get("fs_id") or ""),
+                        sign=row_sign,
+                        timestamp=row_timestamp,
                     )
-                    if dlink:
-                        row["direct_url"] = dlink
-                        direct = row
-                        break
+                    if stream_url:
+                        row["stream_url"] = stream_url
 
-            # Fallback: use the actual TeraBox browser UI/download session.
-            # This catches variants where the web app can download the file but
-            # /share/download does not expose a usable dlink.
+                stream = next(
+                    (row for row in file_rows if row.get("stream_url")),
+                    None,
+                )
+
+            # Last-resort browser UI download. This is deliberately skipped
+            # during queue-size inspection so inspection never downloads the
+            # actual file.
             browser_download_path = ""
-            if not direct and file_rows:
+            selected_name = ""
+            if (
+                allow_native_download
+                and not direct
+                and not stream
+                and file_rows
+            ):
                 try:
                     browser_result, browser_name = await self._browser_native_download(
                         page=page,
@@ -565,40 +641,15 @@ class TeraBoxBrowserResolver:
                             selected_name = browser_name
                         else:
                             file_rows[0]["direct_url"] = browser_result
-                            file_rows[0]["file_name"] = browser_name or file_rows[0].get("file_name")
+                            file_rows[0]["file_name"] = (
+                                browser_name or file_rows[0].get("file_name")
+                            )
                             direct = file_rows[0]
                 except Exception as browser_err:
                     print(
                         f"browser fallback failed: {type(browser_err).__name__}: {browser_err}",
                         flush=True,
                     )
-
-            # Fallback: the working reference implementation can stream a
-            # video through TeraBox's HLS endpoint even when /share/download
-            # does not return a normal dlink.
-            stream = None
-            if not direct and share_id and uk:
-                for row in file_rows:
-                    if row.get("is_dir") or not row.get("fs_id"):
-                        continue
-
-                    file_name = str(row.get("file_name") or "").lower()
-                    if not any(file_name.endswith(ext) for ext in STREAM_VIDEO_EXTENSIONS):
-                        continue
-
-                    row_sign = row.get("sign") or sign
-                    row_timestamp = row.get("timestamp") or timestamp
-                    stream_url = _build_stream_url(
-                        share_id=share_id,
-                        uk=uk,
-                        fs_id=row["fs_id"],
-                        sign=row_sign,
-                        timestamp=row_timestamp,
-                    )
-                    if stream_url:
-                        row["stream_url"] = stream_url
-                        stream = row
-                        break
 
             if not direct and not stream:
                 debug = await page.evaluate(
