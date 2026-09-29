@@ -147,26 +147,17 @@ def _first_list(data):
     )
 
 
-async def _share_page_tokens(session, share_url):
-    """Fetch the public share page and extract short-lived request tokens."""
-    async with session.get(
-        share_url,
-        headers=_headers(share_url, html=True),
-        allow_redirects=True,
-    ) as response:
-        html = await response.text()
-        final_url = str(response.url)
-        if response.status >= 400:
-            raise RuntimeError(
-                f"TeraBox share page HTTP {response.status}"
-            )
+async def _extract_tokens_from_response(response):
+    html = await response.text()
+    final_url = str(response.url)
 
     js_token = ""
     token_patterns = (
-        r'window\.jsToken\s*=\s*["\']([^"\']+)',
-        r'jsToken\s*[:=]\s*["\']([^"\']+)',
+        r'window\\.jsToken\\s*=\\s*["\\']([^"\\']+)',
+        r'jsToken\\s*[:=]\\s*["\\']([^"\\']+)',
+        r'jsToken["\\']?\\s*[:=]\\s*["\\']([^"\\']+)',
         r'fn%28%22([^%]+)%22%29',
-        r'fn\(\x22([^\x22]+)\x22\)',
+        r'fn\\(\\x22([^\\x22]+)\\x22\\)',
     )
     for pattern in token_patterns:
         match = re.search(pattern, html)
@@ -176,7 +167,7 @@ async def _share_page_tokens(session, share_url):
 
     dp_logid = ""
     for pattern in (
-        r'dp-logid[=:]["\']?([0-9]+)',
+        r'dp-logid[=:]["\\']?([0-9]+)',
         r'dp-logid=([0-9]+)',
     ):
         match = re.search(pattern, html)
@@ -184,19 +175,66 @@ async def _share_page_tokens(session, share_url):
             dp_logid = match.group(1)
             break
 
-    if js_token:
-        log.info(
-            "TeraBox share page token extracted: origin=%s dp_logid=%s",
-            urlparse(final_url).netloc,
-            bool(dp_logid),
-        )
-    else:
-        log.info(
-            "TeraBox share page had no jsToken: origin=%s",
-            urlparse(final_url).netloc,
-        )
+    if not dp_logid:
+        query = parse_qs(urlparse(final_url).query)
+        dp_logid = (query.get("dp-logid") or [""])[0]
 
     return final_url, js_token, dp_logid
+
+
+async def _share_page_tokens(session, share_url, surl, origin):
+    """Try TeraBox share HTML variants until a short-lived jsToken is found."""
+    candidates = [
+        ("share-url", share_url, share_url),
+        (
+            "wap-filelist",
+            f"{origin}/wap/share/filelist?surl={surl}",
+            origin + "/",
+        ),
+        (
+            "wap-filelist-prefixed",
+            f"{origin}/wap/share/filelist?surl=1{surl}",
+            origin + "/",
+        ),
+    ]
+
+    errors = []
+    for label, candidate, referer in candidates:
+        try:
+            async with session.get(
+                candidate,
+                headers=_headers(referer, html=True),
+                allow_redirects=True,
+            ) as response:
+                if response.status >= 400:
+                    errors.append(f"{label}: HTTP {response.status}")
+                    continue
+
+                final_url, js_token, dp_logid = await _extract_tokens_from_response(
+                    response
+                )
+                if js_token:
+                    log.info(
+                        "TeraBox token extracted via %s: origin=%s dp_logid=%s",
+                        label,
+                        urlparse(final_url).netloc,
+                        bool(dp_logid),
+                    )
+                    return final_url, js_token, dp_logid
+
+                errors.append(f"{label}: no jsToken")
+                log.info(
+                    "TeraBox token candidate had no jsToken: %s -> %s",
+                    label,
+                    urlparse(final_url).netloc,
+                )
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            errors.append(f"{label}: {exc}")
+
+    raise RuntimeError(
+        "TeraBox share page did not expose jsToken; "
+        + "; ".join(errors)
+    )
 
 
 async def _list_scope(
@@ -255,8 +293,9 @@ async def _resolve_via_shorturlinfo(
 ):
     """Resolve a share through TeraBox's public share-page token flow."""
     if not js_token:
+        page_origin = origin
         page_url, js_token, page_dp_logid = await _share_page_tokens(
-            session, share_url
+            session, share_url, surl, page_origin
         )
         dp_logid = dp_logid or page_dp_logid
     else:
@@ -488,7 +527,7 @@ async def resolve_terabox_url(url: str) -> dict:
                 # Fetch the public share page first so every subsequent web
                 # API request has the current short-lived jsToken.
                 page_url, js_token, dp_logid = await _share_page_tokens(
-                    session, url
+                    session, url, surl, origin
                 )
                 if not js_token:
                     raise RuntimeError(
