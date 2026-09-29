@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -129,7 +130,7 @@ def format_bytes(value: int | float) -> str:
     if value <= 0:
         return "0 B"
     units = ("B", "KB", "MB", "GB", "TB")
-    index = min(len(units) - 1, int(value.bit_length() / 10) if value >= 1024 else 0)
+    index = min(len(units) - 1, int(math.log(value, 1024)) if value >= 1024 else 0)
     return f"{value / (1024 ** index):.2f}".rstrip("0").rstrip(".") + f" {units[index]}"
 
 
