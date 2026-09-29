@@ -153,11 +153,11 @@ async def _extract_tokens_from_response(response):
 
     js_token = ""
     token_patterns = (
-        r'window\\.jsToken\\s*=\\s*["\\']([^"\\']+)',
-        r'jsToken\\s*[:=]\\s*["\\']([^"\\']+)',
-        r'jsToken["\\']?\\s*[:=]\\s*["\\']([^"\\']+)',
-        r'fn%28%22([^%]+)%22%29',
-        r'fn\\(\\x22([^\\x22]+)\\x22\\)',
+        r"window\.jsToken\s*=\s*[\"']([^\"']+)",
+        r"jsToken\s*[:=]\s*[\"']([^\"']+)",
+        r"jsToken[\"']?\s*[:=]\s*[\"']([^\"']+)",
+        r"fn%28%22([^%]+)%22%29",
+        r"fn\(\x22([^\x22]+)\x22\)",
     )
     for pattern in token_patterns:
         match = re.search(pattern, html)
@@ -167,8 +167,8 @@ async def _extract_tokens_from_response(response):
 
     dp_logid = ""
     for pattern in (
-        r'dp-logid[=:]["\\']?([0-9]+)',
-        r'dp-logid=([0-9]+)',
+        r"dp-logid[=:][\"']?([0-9]+)",
+        r"dp-logid=([0-9]+)",
     ):
         match = re.search(pattern, html)
         if match:
