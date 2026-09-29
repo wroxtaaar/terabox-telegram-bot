@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import re
@@ -76,11 +77,24 @@ class Worker:
         # Persist MTProto authorization across Docker container restarts.
         self.session_dir = Path(os.getenv("TELETHON_SESSION_DIR", "/worker/data"))
         self.session_dir.mkdir(parents=True, exist_ok=True)
-        self.session_path = str(self.session_dir / "terabox_bot")
+
+        # Give each bot token its own persistent MTProto session. This is
+        # important when BOT_TOKEN is rotated: a new token must not reuse the
+        # old bot's authorized SQLite session.
+        token_fingerprint = hashlib.sha256(
+            self.bot_token.encode("utf-8")
+        ).hexdigest()[:16]
+        self.session_path = str(
+            self.session_dir / f"terabox_bot_{token_fingerprint}"
+        )
         self.telegram = TelegramClient(
             SQLiteSession(self.session_path),
             self.api_id,
             self.api_hash,
+        )
+        log.info(
+            "Telethon session selected by BOT_TOKEN fingerprint=%s",
+            token_fingerprint,
         )
         self.task: asyncio.Task | None = None
         self.telegram_task: asyncio.Task | None = None
