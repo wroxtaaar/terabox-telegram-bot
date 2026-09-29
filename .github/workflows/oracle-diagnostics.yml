@@ -1,0 +1,45 @@
+name: Oracle VPS Diagnostics
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: oracle-vps-diagnostics
+  cancel-in-progress: true
+
+jobs:
+  diagnostics:
+    name: Inspect Oracle worker
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check Oracle health and logs
+        uses: appleboy/ssh-action@v1.2.2
+        with:
+          host: ${{ secrets.ORACLE_HOST }}
+          username: ${{ secrets.ORACLE_USER }}
+          key: ${{ secrets.ORACLE_SSH_KEY }}
+          command_timeout: 8m
+          script: |
+            set -euo pipefail
+
+            APP_DIR="${HOME}/terabox-telegram-bot"
+            cd "${APP_DIR}"
+
+            echo "==> Current commit"
+            git rev-parse --short HEAD
+            git log -1 --pretty=format:'%H%n%s%n%ci'
+            echo
+
+            echo "==> Container status"
+            docker compose -f vps/docker-compose.yml ps
+
+            echo "==> Health"
+            curl -fsS --max-time 5 http://127.0.0.1:18080/health
+            echo
+
+            echo "==> Recent worker logs"
+            docker compose -f vps/docker-compose.yml logs --tail=200
+
+            echo "==> Diagnostics complete"
