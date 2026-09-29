@@ -7,6 +7,7 @@ class Settings:
     api_id: int
     api_hash: str
     webhook_secret: str
+    public_base_url: str
     port: int
 
 def load_settings() -> Settings:
@@ -14,5 +15,13 @@ def load_settings() -> Settings:
     api_id_raw=os.getenv("API_ID","").strip()
     api_hash=os.getenv("API_HASH","").strip()
     missing=[k for k,v in (("BOT_TOKEN",bot_token),("API_ID",api_id_raw),("API_HASH",api_hash)) if not v]
-    if missing: raise RuntimeError("Missing required environment variables: "+", ".join(missing))
-    return Settings(bot_token,int(api_id_raw),api_hash,os.getenv("WEBHOOK_SECRET","").strip(),int(os.getenv("PORT","10000")))
+    if missing:
+        raise RuntimeError("Missing required environment variables: "+", ".join(missing))
+    return Settings(
+        bot_token=bot_token,
+        api_id=int(api_id_raw),
+        api_hash=api_hash,
+        webhook_secret=os.getenv("WEBHOOK_SECRET","").strip(),
+        public_base_url=os.getenv("PUBLIC_BASE_URL","").strip().rstrip("/"),
+        port=int(os.getenv("PORT","10000")),
+    )
