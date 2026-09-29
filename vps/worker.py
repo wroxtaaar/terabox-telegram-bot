@@ -421,6 +421,7 @@ class Worker:
                 sign=str(resolved.get("sign") or ""),
                 timestamp=str(resolved.get("timestamp") or ""),
                 fs_id=str(resolved.get("fs_id") or ""),
+                randsk=str(resolved.get("randsk") or ""),
                 progress=progress,
             )
             log.info(
