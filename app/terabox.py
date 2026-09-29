@@ -8,6 +8,8 @@ import os
 import re
 from urllib.parse import parse_qs, urlparse
 
+from playwright.async_api import async_playwright
+
 import aiohttp
 
 log = logging.getLogger(__name__)
@@ -181,6 +183,132 @@ async def _extract_tokens_from_response(response):
         dp_logid = (query.get("dp-logid") or [""])[0]
 
     return final_url, js_token, dp_logid
+
+
+async def _resolve_via_browser(session, share_url, surl):
+    """Resolve a public share with a fresh in-memory Chromium session."""
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+            ],
+        )
+        context = await browser.new_context(
+            user_agent=UA,
+            locale="en-US",
+            viewport={"width": 1280, "height": 900},
+        )
+        page = await context.new_page()
+        responses = []
+
+        async def capture_response(response):
+            response_url = response.url
+            if any(
+                marker in response_url
+                for marker in ("/api/shorturlinfo", "/share/list", "/share/download")
+            ):
+                try:
+                    content_type = (
+                        response.headers.get("content-type") or ""
+                    ).lower()
+                    if "json" not in content_type:
+                        return
+                    data = await response.json()
+                    responses.append((response_url, data))
+                except Exception:
+                    pass
+
+        page.on("response", capture_response)
+
+        try:
+            response = await page.goto(
+                share_url,
+                wait_until="domcontentloaded",
+                timeout=45_000,
+            )
+            log.info(
+                "Chromium share page: status=%s url=%s title=%r",
+                response.status if response else 0,
+                page.url,
+                await page.title(),
+            )
+
+            await page.wait_for_timeout(8_000)
+
+            # Some versions expose jsToken only after the page's JavaScript runs.
+            html = await page.content()
+            scripts = await page.locator("script").all_text_contents()
+            token_text = "\\n".join([html, *scripts])
+            token_match = re.search(
+                r"""(?:jsToken|jstoken|js_token)\\s*["':=]+\\s*["']([^"']+)["']""",
+                token_text,
+                re.IGNORECASE,
+            )
+            js_token = token_match.group(1).strip() if token_match else ""
+
+            if not js_token:
+                try:
+                    js_token = str(
+                        await page.evaluate(
+                            """() => {
+                                for (const key of [
+                                    'jsToken',
+                                    'jstoken',
+                                    'js_token',
+                                    'JSTOKEN'
+                                ]) {
+                                    try {
+                                        if (window[key]) return String(window[key]);
+                                    } catch (_) {}
+                                }
+                                return '';
+                            }"""
+                        )
+                    ).strip()
+                except Exception:
+                    js_token = ""
+
+            # First prefer a file response already made by the share page itself.
+            for response_url, data in responses:
+                if not isinstance(data, dict):
+                    continue
+                rows = [
+                    _normalize(item)
+                    for item in _first_list(data)
+                    if isinstance(item, dict)
+                ]
+                usable = [item for item in rows if item["direct_url"]]
+                if usable:
+                    log.info(
+                        "Chromium captured direct file metadata from %s",
+                        urlparse(response_url).path,
+                    )
+                    return usable[0], rows
+
+            if not js_token:
+                raise RuntimeError(
+                    "Chromium loaded the share but exposed neither jsToken "
+                    "nor a direct file response."
+                )
+
+            origin = (
+                f"{urlparse(page.url).scheme}://"
+                f"{urlparse(page.url).netloc}"
+            )
+            row, rows = await _resolve_via_shorturlinfo(
+                session,
+                origin,
+                page.url,
+                surl,
+                js_token=js_token,
+            )
+            return row, rows
+        finally:
+            await context.close()
+            await browser.close()
 
 
 async def _share_page_tokens(session, share_url, surl, origin):
@@ -755,9 +883,32 @@ async def resolve_terabox_url(url: str) -> dict:
                     exc,
                 )
 
-        # This service is deliberately the independent direct resolver.
-        # Do not call the old Cloudflare gateway here; doing so would hide the
-        # real TeraBox response we are trying to diagnose.
+        # Last attempt: run the public share application in fresh,
+        # non-persistent Chromium state and reuse any token it exposes.
+        try:
+            row, browser_rows = await _resolve_via_browser(
+                session, url, surl
+            )
+            log.info(
+                "TeraBox Chromium resolver returned %s",
+                row["file_name"],
+            )
+            return _result(
+                surl,
+                row,
+                browser_rows,
+            )
+        except (
+            aiohttp.ClientError,
+            asyncio.TimeoutError,
+            RuntimeError,
+        ) as exc:
+            last = exc
+            log.info(
+                "TeraBox Chromium resolver failed: %s",
+                exc,
+            )
+
         raise RuntimeError(
             f"Direct TeraBox resolution failed. Last error: {last}"
         )
