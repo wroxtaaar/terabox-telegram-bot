@@ -11,3 +11,8 @@ services:
     init: true
     security_opt:
       - no-new-privileges:true
+    volumes:
+      - terabox_worker_data:/worker/data
+
+volumes:
+  terabox_worker_data:
