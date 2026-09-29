@@ -3,15 +3,17 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import tempfile
 import time
+import uuid
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from urllib.parse import urlparse
 
 import aiohttp
-from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel, Field
-from telethon import TelegramClient
+from fastapi import FastAPI
+from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
 from .browser_resolver import TeraBoxBrowserResolver
@@ -22,45 +24,76 @@ logging.basicConfig(
 )
 log = logging.getLogger("terabox-vps-worker")
 
+TERABOX_HOSTS = {
+    "terabox.com",
+    "www.terabox.com",
+    "1024terabox.com",
+    "www.1024terabox.com",
+    "teraboxapp.com",
+    "www.teraboxapp.com",
+    "terabox.app",
+    "www.terabox.app",
+    "1024tera.com",
+    "www.1024tera.com",
+    "teraboxlink.com",
+    "www.teraboxlink.com",
+    "terasharelink.com",
+    "www.terasharelink.com",
+    "terasharefile.com",
+    "www.terasharefile.com",
+    "terafileshare.com",
+    "www.terafileshare.com",
+    "teraboxshare.com",
+    "www.teraboxshare.com",
+}
 
-class Job(BaseModel):
-    job_id: str = Field(min_length=4, max_length=100)
+@dataclass(slots=True)
+class Job:
+    job_id: str
     chat_id: int
     url: str
-    callback_url: str
-
 
 class Worker:
     def __init__(self):
         self.bot_token = os.getenv("BOT_TOKEN", "").strip()
-        self.api_id = int(os.getenv("API_ID", "0"))
+        try:
+            self.api_id = int(os.getenv("API_ID", "0"))
+        except ValueError as exc:
+            raise RuntimeError("API_ID must be numeric.") from exc
         self.api_hash = os.getenv("API_HASH", "").strip()
-        self.worker_secret = os.getenv("VPS_WORKER_SECRET", "").strip()
         self.max_download_bytes = int(
             os.getenv("MAX_DOWNLOAD_BYTES", str(10 * 1024 * 1024 * 1024))
         )
 
         if not self.bot_token or not self.api_id or not self.api_hash:
             raise RuntimeError("BOT_TOKEN, API_ID and API_HASH are required.")
-        if not self.worker_secret:
-            raise RuntimeError("VPS_WORKER_SECRET is required.")
 
         self.queue: asyncio.Queue[Job] = asyncio.Queue()
         self.resolver = TeraBoxBrowserResolver(max_concurrent=1)
-        self.telegram = TelegramClient(
-            StringSession(),
-            self.api_id,
-            self.api_hash,
-        )
+        self.telegram = TelegramClient(StringSession(), self.api_id, self.api_hash)
         self.task: asyncio.Task | None = None
 
     async def start(self):
         log.info("Starting Chromium resolver...")
         await self.resolver.start()
-        log.info("Starting Telethon MTProto client on VPS...")
+
+        log.info("Starting Telegram MTProto bot client on VPS...")
         await self.telegram.start(bot_token=self.bot_token)
+
+        self.telegram.add_event_handler(
+            self._on_message,
+            events.NewMessage(incoming=True),
+        )
+
+        me = await self.telegram.get_me()
+        log.info(
+            "Telegram bot connected: username=@%s id=%s",
+            getattr(me, "username", None),
+            getattr(me, "id", None),
+        )
+
         self.task = asyncio.create_task(self._queue_loop())
-        log.info("VPS worker ready.")
+        log.info("VPS worker ready; Telegram intake is running directly on Oracle.")
 
     async def stop(self):
         if self.task:
@@ -71,17 +104,50 @@ class Worker:
                 pass
             self.task = None
 
-        await self.telegram.disconnect()
+        if self.telegram.is_connected():
+            await self.telegram.disconnect()
+
         await self.resolver.stop()
 
-    async def enqueue(self, job: Job):
-        await self.queue.put(job)
-        log.info(
-            "job queued id=%s queue_size=%s chat_id=%s",
-            job.job_id,
-            self.queue.qsize(),
-            job.chat_id,
+    async def _on_message(self, event):
+        text = (event.raw_text or "").strip()
+        chat_id = event.chat_id
+
+        if not chat_id:
+            return
+
+        if text in {"/start", "/help"}:
+            await event.reply(
+                "Send me a TeraBox link and I will resolve and send the file."
+            )
+            return
+
+        urls = re.findall(r"https?://\S+", text)
+        if not urls:
+            return
+
+        url = urls[0].rstrip(").,>")
+        if not self._is_terabox_url(url):
+            return
+
+        job = Job(
+            job_id=uuid.uuid4().hex,
+            chat_id=int(chat_id),
+            url=url,
         )
+
+        log.info(
+            "telegram message accepted job=%s chat_id=%s queue_size_before=%s url=%s",
+            job.job_id,
+            job.chat_id,
+            self.queue.qsize(),
+            job.url,
+        )
+
+        await event.reply(
+            f"⏳ Queued your TeraBox link. Job: {job.job_id[:8]}"
+        )
+        await self.queue.put(job)
 
     async def _queue_loop(self):
         while True:
@@ -90,41 +156,24 @@ class Worker:
                 await self._run_job(job)
             except Exception:
                 log.exception("Unhandled job failure id=%s", job.job_id)
+                try:
+                    await self.telegram.send_message(
+                        job.chat_id,
+                        f"❌ Job {job.job_id[:8]} failed unexpectedly.",
+                    )
+                except Exception:
+                    log.exception("Could not send unexpected-failure message id=%s", job.job_id)
             finally:
                 self.queue.task_done()
-
-    async def _callback(self, job: Job, status: str, message: str = "", **extra):
-        payload = {
-            "job_id": job.job_id,
-            "chat_id": job.chat_id,
-            "status": status,
-            "message": message[:1000],
-            **extra,
-        }
-
-        try:
-            timeout = aiohttp.ClientTimeout(total=15, connect=8)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(job.callback_url, json=payload) as response:
-                    body = await response.text()
-                    if response.status >= 400:
-                        log.warning(
-                            "callback failed id=%s HTTP=%s body=%s",
-                            job.job_id,
-                            response.status,
-                            body[:300],
-                        )
-        except Exception:
-            log.exception("callback exception id=%s status=%s", job.job_id, status)
 
     async def _run_job(self, job: Job):
         started = time.monotonic()
         temp_path: Path | None = None
 
-        await self._callback(job, "resolving", "Opening TeraBox in Chromium.")
-        log.info("job=%s resolving url=%s", job.job_id, job.url)
-
+        await self._status(job, "🔎 Resolving TeraBox link…")
         try:
+            log.info("job=%s resolving url=%s", job.job_id, job.url)
+
             resolved = await self.resolver.resolve(job.url)
             filename = self._safe_filename(
                 resolved.get("file_name") or "terabox-file"
@@ -143,52 +192,37 @@ class Worker:
                 resolved.get("resolve_ms"),
             )
 
-            await self._callback(
+            await self._status(
                 job,
-                "resolved",
-                "TeraBox resolved successfully.",
-                file_name=filename,
-                size=size,
+                f"✅ Resolved: {filename}\n⬇️ Starting download…",
             )
 
             temp_path, downloaded_size = await self._download(
                 job, direct_url, filename, expected_size=size
             )
 
-            await self._callback(
-                job,
-                "uploading",
-                f"Uploading {filename} to Telegram.",
-                file_name=filename,
-                size=downloaded_size,
-            )
+            await self._status(job, f"📤 Uploading {filename} to Telegram…")
 
-            await self._send_file(
-                job.chat_id,
-                temp_path,
-                filename,
-            )
+            await self._send_file(job.chat_id, temp_path, filename)
 
             elapsed = round(time.monotonic() - started, 2)
             log.info(
-                "job=%s completed filename=%s elapsed=%ss",
+                "job=%s completed filename=%s size=%s elapsed=%ss",
                 job.job_id,
                 filename,
+                downloaded_size,
                 elapsed,
             )
-            await self._callback(
+
+            await self._status(
                 job,
-                "completed",
-                f"Delivered in {elapsed}s.",
-                file_name=filename,
-                size=downloaded_size,
+                f"✅ Sent successfully: {filename}\n⏱ {elapsed}s",
             )
         except Exception as exc:
             log.exception("job=%s failed", job.job_id)
-            await self._callback(
+            await self._status(
                 job,
-                "failed",
-                str(exc),
+                f"❌ TeraBox delivery failed: {self._compact_error(exc)}",
             )
         finally:
             if temp_path:
@@ -197,19 +231,8 @@ class Worker:
                 except Exception:
                     log.warning("Could not remove temp file %s", temp_path)
 
-    async def _download(
-        self,
-        job: Job,
-        url: str,
-        filename: str,
-        *,
-        expected_size: int = 0,
-    ) -> tuple[Path, int]:
-        timeout = aiohttp.ClientTimeout(
-            total=None,
-            connect=20,
-            sock_read=120,
-        )
+    async def _download(self, job: Job, url: str, filename: str, *, expected_size: int = 0) -> tuple[Path, int]:
+        timeout = aiohttp.ClientTimeout(total=None, connect=20, sock_read=120)
         tmp = tempfile.NamedTemporaryFile(
             prefix=f"terabox-{job.job_id}-",
             suffix=Path(filename).suffix or ".bin",
@@ -219,15 +242,14 @@ class Worker:
         path = Path(tmp.name)
         total = 0
         last_log = 0
+        last_messenger_update = 0
+        last_messenger_percent = -1
 
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(
                     url,
-                    headers={
-                        "User-Agent": "Mozilla/5.0",
-                        "Accept": "*/*",
-                    },
+                    headers={"User-Agent": "Mozilla/5.0", "Accept": "*/*"},
                     allow_redirects=True,
                 ) as response:
                     response.raise_for_status()
@@ -235,18 +257,11 @@ class Worker:
                     declared = max(expected_size, content_length)
 
                     log.info(
-                        "job=%s downloading HTTP=%s size=%s",
+                        "job=%s downloading HTTP=%s expected_size=%s content_length=%s",
                         job.job_id,
                         response.status,
-                        declared,
-                    )
-
-                    await self._callback(
-                        job,
-                        "downloading",
-                        f"Downloading {filename}.",
-                        file_name=filename,
-                        size=declared,
+                        expected_size,
+                        content_length,
                     )
 
                     with tmp:
@@ -261,11 +276,27 @@ class Worker:
                             now = time.monotonic()
                             if now - last_log >= 5:
                                 last_log = now
-                                log.info(
-                                    "job=%s download_progress=%s bytes",
-                                    job.job_id,
-                                    total,
-                                )
+                                if declared:
+                                    percent = min(100, int(total * 100 / declared))
+                                    log.info(
+                                        "job=%s download_progress=%s/%s bytes (%s%%)",
+                                        job.job_id, total, declared, percent
+                                    )
+                                    if (
+                                        percent >= last_messenger_percent + 10
+                                        and now - last_messenger_update >= 10
+                                    ):
+                                        last_messenger_percent = percent
+                                        last_messenger_update = now
+                                        await self._status(
+                                            job,
+                                            f"⬇️ Downloading {filename}: {percent}%",
+                                        )
+                                else:
+                                    log.info(
+                                        "job=%s download_progress=%s bytes",
+                                        job.job_id, total
+                                    )
         except Exception:
             try:
                 path.unlink(missing_ok=True)
@@ -281,7 +312,8 @@ class Worker:
 
     async def _send_file(self, chat_id: int, path: Path, filename: str):
         streaming_extensions = {
-            ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".mp3", ".m4a", ".aac"
+            ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v",
+            ".mp3", ".m4a", ".aac",
         }
         supports_streaming = path.suffix.lower() in streaming_extensions
 
@@ -293,18 +325,42 @@ class Worker:
             supports_streaming=supports_streaming,
         )
 
+    async def _status(self, job: Job, text: str):
+        try:
+            await self.telegram.send_message(job.chat_id, text)
+            log.info(
+                "job=%s status_sent chat_id=%s text=%s",
+                job.job_id,
+                job.chat_id,
+                text.replace("\n", " ")[:240],
+            )
+        except Exception:
+            log.exception("job=%s could not send Telegram status", job.job_id)
+
+    @staticmethod
+    def _is_terabox_url(value: str) -> bool:
+        try:
+            host = (urlparse(value.strip()).hostname or "").lower()
+        except ValueError:
+            return False
+        return host in TERABOX_HOSTS or host.endswith(".terabox.com")
+
+    @staticmethod
+    def _compact_error(exc: Exception) -> str:
+        text = str(exc).strip().replace("\n", " ")
+        return text[:800] or exc.__class__.__name__
+
     @staticmethod
     def _safe_filename(value: str) -> str:
         clean = Path(value.replace("\\", "/")).name.strip()
         clean = "".join(
-            char if char.isprintable() and char not in "\x00\r\n"
-            else "_"
+            char if char.isprintable() and char not in "\x00\r\n" else "_"
             for char in clean
         )
         return clean[:240] or "terabox-file"
 
 
-app = FastAPI(title="TeraBox VPS Worker")
+app = FastAPI(title="TeraBox Oracle VPS Worker")
 worker: Worker | None = None
 
 
@@ -325,24 +381,10 @@ async def shutdown():
 async def health():
     if not worker:
         return {"status": "starting"}
+
     return {
         "status": "ok",
         "queue_size": worker.queue.qsize(),
         "browser": bool(worker.resolver.browser),
         "telegram_connected": worker.telegram.is_connected(),
-    }
-
-
-@app.post("/job")
-async def create_job(job: Job, x_worker_secret: str = Header(default="")):
-    if not worker:
-        raise HTTPException(503, "Worker is starting.")
-    if x_worker_secret != worker.worker_secret:
-        raise HTTPException(404)
-
-    await worker.enqueue(job)
-    return {
-        "accepted": True,
-        "job_id": job.job_id,
-        "queue_size": worker.queue.qsize(),
     }
