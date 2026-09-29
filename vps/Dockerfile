@@ -16,6 +16,7 @@ RUN apt-get update \
 
 COPY browser_resolver.py ./vps/browser_resolver.py
 COPY stream_downloader.py ./vps/stream_downloader.py
+COPY splitter.py ./vps/splitter.py
 COPY worker.py ./vps/worker.py
 COPY __init__.py ./vps/__init__.py
 
