@@ -121,7 +121,7 @@ class QueueTask:
     url: str
     file_names: list[str] | None = None
     size_bytes: int | None = None
-    size_is_estimated: bool = False
+    # Queue size is the actual total source size reported by TeraBox.
     cancel_requested: bool = False
     retry_count: int = 0
     queued_at: float = field(default_factory=time.time)
@@ -385,6 +385,46 @@ class Worker:
                     if isinstance(item, dict)
                 )
         return None
+
+    async def _resolve_missing_file_sizes(self, files: list[dict]) -> None:
+        """Fill missing TeraBox sizes from resolved download URLs without downloading data."""
+        if not self.http_session:
+            return
+
+        timeout = aiohttp.ClientTimeout(total=15, connect=8, sock_read=8)
+        for item in files:
+            try:
+                current_size = int(item.get("size") or 0)
+            except (TypeError, ValueError):
+                current_size = 0
+            if current_size > 0:
+                continue
+
+            url = str(item.get("direct_url") or "").strip()
+            if not url:
+                continue
+
+            try:
+                async with self.http_session.head(
+                    url,
+                    allow_redirects=True,
+                    timeout=timeout,
+                ) as response:
+                    content_length = int(response.headers.get("Content-Length") or 0)
+                    if content_length > 0:
+                        item["size"] = content_length
+                        continue
+
+                    content_range = str(response.headers.get("Content-Range") or "")
+                    match = re.search(r"/(\d+)$", content_range)
+                    if match:
+                        item["size"] = int(match.group(1))
+            except Exception as exc:
+                log.debug(
+                    "Could not resolve size for %s: %s",
+                    item.get("file_name") or "unknown file",
+                    self._compact_error(exc),
+                )
 
     def _queued_count(self) -> int:
         return len(self.size_inspection_queue) + len(self.download_queue)
@@ -811,10 +851,8 @@ class Worker:
         name_label = self._queue_names(task)
         if task.size_bytes and task.size_bytes > 0:
             size = format_bytes(task.size_bytes)
-            if task.size_is_estimated:
-                size = "~" + size + " estimated"
         else:
-            size = "Size unavailable"
+            size = "Resolving..."
         return f"{index}. {size} — {name_label} [{task.task_id[:8]}]"
 
     async def _send_queue_command(self, chat_id: int):
@@ -828,11 +866,7 @@ class Worker:
                 + f" [{active.task_id[:8]}]"
             )
 
-        inspection = (
-            "\n".join(self._queue_task_line(i + 1, task) for i, task in enumerate(self.size_inspection_queue))
-            if self.size_inspection_queue
-            else "Empty"
-        )
+        inspection_count = len(self.size_inspection_queue) + (1 if self.inspecting_task else 0)
         ready = sorted((queued_task for _, _, _, queued_task in self.download_queue), key=self._sort_key)
         queue_lines = (
             "\n".join(self._queue_task_line(i + 1, task) for i, task in enumerate(ready))
@@ -844,7 +878,7 @@ class Worker:
             "📋 Download Queue\n\n"
             + active_line
             + "\n\n"
-            + f"🔎 Finding file sizes ({len(self.size_inspection_queue) + (1 if self.inspecting_task else 0)}):\n{inspection}\n\n"
+            + (f"🔎 Resolving actual file sizes ({inspection_count}): Please wait…\n\n" if inspection_count else "")
             + f"⏳ Download queue ({len(ready)} waiting, smallest first):\n{queue_lines}"
         )
         await self.telegram.send_message(chat_id, text[:3900])
@@ -907,14 +941,16 @@ class Worker:
                 safe_filename(str(item.get("file_name") or "terabox-file"))
                 for item in files
             ]
+            await self._resolve_missing_file_sizes(files)
             total = sum(int(item.get("size") or 0) for item in files)
-            known = self._known_downloaded_size(task.url)
-            task.size_bytes = known if known is not None else total
-            task.size_is_estimated = known is None
 
             if not task.file_names:
-                task.file_names = []
-                task.size_bytes = None
+                raise RuntimeError("No files were found in this TeraBox link.")
+            if total <= 0:
+                raise RuntimeError("Could not determine the actual file size yet.")
+
+            # TeraBox's metadata size is the source file size, not an estimate.
+            task.size_bytes = total
         except Exception as exc:
             log.warning(
                 "task=%s metadata inspection failed: %s",
@@ -923,19 +959,46 @@ class Worker:
             )
             task.file_names = []
             task.size_bytes = None
-            task.size_is_estimated = False
         finally:
             self.inspecting_task = None
 
-        if not task.cancel_requested:
-            self._push_download_task(task)
-            self.download_event.set()
-            log.info(
-                "task=%s moved to download queue size=%s ready=%s",
+        if task.cancel_requested:
+            return
+
+        if task.size_bytes is None:
+            if task.retry_count < 2:
+                task.retry_count += 1
+                self.size_inspection_queue.append(task)
+                self.size_event.set()
+                log.info(
+                    "task=%s size inspection retry=%s",
+                    task.task_id,
+                    task.retry_count,
+                )
+                return
+
+            log.warning(
+                "task=%s could not determine an actual size after retries; dropping from queue",
                 task.task_id,
-                task.size_bytes if task.size_bytes is not None else "unknown",
-                len(self.download_queue),
             )
+            if self.telegram.is_connected():
+                try:
+                    await self.telegram.send_message(
+                        task.chat_id,
+                        "❌ I could not determine the actual file size for this TeraBox link, so it was not added to the download queue.",
+                    )
+                except Exception:
+                    pass
+            return
+
+        self._push_download_task(task)
+        self.download_event.set()
+        log.info(
+            "task=%s moved to download queue size=%s ready=%s",
+            task.task_id,
+            task.size_bytes,
+            len(self.download_queue),
+        )
 
     async def _size_inspection_loop(self):
         # Two metadata resolutions can run concurrently. Each completed task
