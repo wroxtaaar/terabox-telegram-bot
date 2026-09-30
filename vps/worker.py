@@ -1577,6 +1577,7 @@ class Worker:
                 fs_id=str(source.get("fs_id") or resolved.get("fs_id") or ""),
                 randsk=str(resolved.get("randsk") or ""),
                 progress=progress,
+                http_session=self.http_session,
             )
             if not path.exists():
                 raise RuntimeError(
