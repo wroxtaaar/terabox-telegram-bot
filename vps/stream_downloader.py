@@ -301,7 +301,7 @@ async def download_m3u8_stream(
 
                 return position, part_path, segment_bytes
 
-            #             results = await asyncio.gather(
+            results = await asyncio.gather(
                 *(
                     fetch_segment(position, index)
                     for position, index in enumerate(indices, 1)
