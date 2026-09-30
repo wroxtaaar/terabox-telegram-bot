@@ -264,6 +264,7 @@ class Worker:
         self.size_task: asyncio.Task | None = None
         self.download_task: asyncio.Task | None = None
         self.telegram_task: asyncio.Task | None = None
+        self.http_session: aiohttp.ClientSession | None = None
 
         self.jobs: list[dict] = self._load_jobs()
         self.link_counters: dict[str, tuple[str, int]] = {}
@@ -272,6 +273,11 @@ class Worker:
             "Telethon session selected by BOT_TOKEN fingerprint=%s",
             token_fingerprint,
         )
+        try:
+            import cryptg  # noqa: F401
+            log.info("cryptg acceleration is available for Telethon.")
+        except ImportError:
+            log.warning("cryptg is not installed; Telethon encryption will use Python fallbacks.")
 
     # ---------- persistence / queue helpers ----------
 
@@ -396,6 +402,17 @@ class Worker:
         log.info("Starting Chromium resolver...")
         await self.resolver.start()
 
+        self.http_session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=None, connect=20, sock_read=120),
+            connector=aiohttp.TCPConnector(
+                limit=16,
+                limit_per_host=16,
+                ttl_dns_cache=300,
+                keepalive_timeout=30,
+                enable_cleanup_closed=True,
+            ),
+        )
+
         log.info("Removing any legacy Telegram Bot API webhook...")
         await self._delete_bot_api_webhook()
         await self._set_bot_commands()
@@ -433,6 +450,10 @@ class Worker:
 
         if self.telegram.is_connected():
             await self.telegram.disconnect()
+
+        if self.http_session and not self.http_session.closed:
+            await self.http_session.close()
+        self.http_session = None
 
         await self.resolver.stop()
 
@@ -1264,6 +1285,10 @@ class Worker:
         cookies: str = "",
         referer: str = "",
     ) -> tuple[Path, int]:
+        session = self.http_session
+        if session is None or session.closed:
+            raise RuntimeError("HTTP session is not available.")
+
         timeout = aiohttp.ClientTimeout(total=None, connect=20, sock_read=120)
         suffix = Path(filename).suffix or ".bin"
         fd, temp_name = tempfile.mkstemp(
@@ -1274,6 +1299,18 @@ class Worker:
         os.close(fd)
         path = Path(temp_name)
         path.parent.mkdir(parents=True, exist_ok=True)
+
+        base_headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
+            "Accept": "*/*",
+            "Accept-Encoding": "identity",
+            "Referer": referer or "https://www.terabox.app/",
+            **({"Cookie": cookies} if cookies else {}),
+        }
 
         total = 0
         content_length = 0
@@ -1286,45 +1323,47 @@ class Worker:
         }
 
         try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(
-                    url,
-                    headers={
-                        "User-Agent": (
-                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                            "AppleWebKit/537.36 (KHTML, like Gecko) "
-                            "Chrome/131.0.0.0 Safari/537.36"
-                        ),
-                        "Accept": "*/*",
-                        "Referer": referer or "https://www.terabox.app/",
-                        **({"Cookie": cookies} if cookies else {}),
-                    },
-                    allow_redirects=True,
-                ) as response:
-                    response.raise_for_status()
-                    content_length = int(response.headers.get("Content-Length") or 0)
-                    content_type = (
-                        response.headers.get("Content-Type") or ""
-                    ).split(";", 1)[0].strip().lower()
+            # First request discovers whether the CDN supports byte ranges and
+            # gives us the authoritative size. We retain the connection in the
+            # shared pool for all subsequent range requests.
+            async with session.get(
+                url,
+                headers=base_headers,
+                allow_redirects=True,
+                timeout=timeout,
+            ) as response:
+                response.raise_for_status()
+                content_length = int(response.headers.get("Content-Length") or 0)
+                accept_ranges = (
+                    response.headers.get("Accept-Ranges", "").lower() == "bytes"
+                )
+                content_type = (
+                    response.headers.get("Content-Type") or ""
+                ).split(";", 1)[0].strip().lower()
 
-                    if content_type in blocked_types:
-                        raise RuntimeError(
-                            f"Resolved URL returned a non-file response ({content_type})."
-                        )
-
-                    declared = max(expected_size, content_length)
-                    log.info(
-                        "task=%s direct download HTTP=%s expected=%s content_length=%s type=%s final=%s",
-                        task.task_id,
-                        response.status,
-                        expected_size,
-                        content_length,
-                        content_type or "<missing>",
-                        response.url,
+                if content_type in blocked_types:
+                    raise RuntimeError(
+                        f"Resolved URL returned a non-file response ({content_type})."
                     )
 
+                authoritative_size = max(expected_size, content_length)
+                log.info(
+                    "task=%s direct download HTTP=%s expected=%s content_length=%s "
+                    "ranges=%s type=%s final=%s",
+                    task.task_id,
+                    response.status,
+                    expected_size,
+                    content_length,
+                    accept_ranges,
+                    content_type or "<missing>",
+                    response.url,
+                )
+
+                if not accept_ranges or authoritative_size <= 0:
+                    # Fallback to one sequential stream when the CDN does not
+                    # advertise range support.
                     with path.open("wb") as output:
-                        async for chunk in response.content.iter_chunked(1024 * 1024):
+                        async for chunk in response.content.iter_chunked(4 * 1024 * 1024):
                             self._check_cancel(task)
                             total += len(chunk)
                             if total > MAX_DOWNLOAD_BYTES:
@@ -1332,24 +1371,149 @@ class Worker:
                                     f"File exceeds MAX_DOWNLOAD_BYTES ({MAX_DOWNLOAD_BYTES})."
                                 )
                             output.write(chunk)
+                    if total <= 0:
+                        raise RuntimeError("TeraBox direct URL returned an empty file.")
+                    if expected_size and total != expected_size:
+                        raise RuntimeError(
+                            f"TeraBox download size mismatch: expected {expected_size} bytes, received {total} bytes."
+                        )
+                    return path, total
 
-                            if declared and total and total % (16 * 1024 * 1024) < len(chunk):
-                                log.info(
-                                    "task=%s download_progress=%s%%",
-                                    task.task_id,
-                                    min(100, round(total * 100 / declared)),
+            size = authoritative_size
+            if size > MAX_DOWNLOAD_BYTES:
+                raise RuntimeError(
+                    f"File exceeds MAX_DOWNLOAD_BYTES ({MAX_DOWNLOAD_BYTES})."
+                )
+
+            try:
+                workers = max(
+                    1,
+                    min(6, int(os.getenv("DIRECT_DOWNLOAD_CONCURRENCY", "4"))),
+                )
+                range_mb = max(
+                    2,
+                    min(16, int(os.getenv("DIRECT_DOWNLOAD_RANGE_MB", "8"))),
+                )
+            except (TypeError, ValueError):
+                workers = 4
+                range_mb = 8
+
+            chunk_size = range_mb * 1024 * 1024
+            ranges = [
+                (start, min(size - 1, start + chunk_size - 1))
+                for start in range(0, size, chunk_size)
+            ]
+
+            concurrency = min(workers, len(ranges))
+            write_handle = await asyncio.to_thread(path.open, "wb")
+            write_handle.close()
+            write_offsets = asyncio.Lock()
+
+            async def fetch_range(range_start: int, range_end: int) -> int:
+                for attempt in range(4):
+                    self._check_cancel(task)
+                    try:
+                        headers = dict(base_headers)
+                        headers["Range"] = f"bytes={range_start}-{range_end}"
+                        async with session.get(
+                            url,
+                            headers=headers,
+                            allow_redirects=True,
+                            timeout=timeout,
+                        ) as response:
+                            if response.status not in (200, 206):
+                                raise RuntimeError(
+                                    f"Range HTTP {response.status} for {range_start}-{range_end}"
                                 )
 
-            if total <= 0:
-                raise RuntimeError("TeraBox direct URL returned an empty file.")
+                            data = await response.read()
+                            expected = range_end - range_start + 1
+                            if response.status == 206 and len(data) != expected:
+                                raise RuntimeError(
+                                    f"Short range response: expected {expected}, got {len(data)}"
+                                )
+
+                            # Some CDNs silently ignore Range and return the full
+                            # object. Never let that overwrite the requested range.
+                            if response.status == 200 and len(data) != size:
+                                raise RuntimeError(
+                                    f"Unexpected full response length {len(data)} for range request"
+                                )
+                            if response.status == 200 and range_start != 0:
+                                raise RuntimeError(
+                                    "CDN ignored Range header for a non-zero offset."
+                                )
+
+                            offset = range_start
+                            async with write_offsets:
+                                with path.open("r+b") as output:
+                                    output.seek(offset)
+                                    output.write(
+                                        data
+                                        if response.status == 206
+                                        else data[: range_end - range_start + 1]
+                                    )
+                            return len(data) if response.status == 206 else (
+                                range_end - range_start + 1
+                            )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        if attempt >= 3:
+                            raise
+                        delay = 0.5 * (2 ** attempt)
+                        log.warning(
+                            "task=%s direct range %s-%s failed attempt=%s: %s; retrying %.1fs",
+                            task.task_id,
+                            range_start,
+                            range_end,
+                            attempt + 1,
+                            self._compact_error(exc),
+                            delay,
+                        )
+                        await asyncio.sleep(delay)
+
+                raise RuntimeError("unreachable")
+
+            completed = 0
+            total_ranges = len(ranges)
+            bytes_done = 0
+            bytes_lock = asyncio.Lock()
+
+            semaphore = asyncio.Semaphore(concurrency)
+
+            async def worker_range(item):
+                nonlocal completed, bytes_done
+                async with semaphore:
+                    got = await fetch_range(*item)
+                async with bytes_lock:
+                    completed += 1
+                    bytes_done += got
+                    if completed == total_ranges or completed % max(1, total_ranges // 10) == 0:
+                        log.info(
+                            "task=%s direct ranges=%s/%s bytes=%s/%s",
+                            task.task_id,
+                            completed,
+                            total_ranges,
+                            bytes_done,
+                            size,
+                        )
+                return got
+
+            await asyncio.gather(*(worker_range(item) for item in ranges))
+
+            total = path.stat().st_size
+            if total != size:
+                raise RuntimeError(
+                    f"Ranged download size mismatch: expected {size} bytes, received {total} bytes."
+                )
             if expected_size and total != expected_size:
                 raise RuntimeError(
                     f"TeraBox download size mismatch: expected {expected_size} bytes, received {total} bytes."
                 )
             return path, total
         except Exception:
-            if path.exists():
-                path.unlink(missing_ok=True)
+            path.unlink(missing_ok=True)
             raise
 
     async def _download_hls(
