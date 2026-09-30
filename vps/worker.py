@@ -722,31 +722,42 @@ class Worker:
         )
         await self.telegram.send_message(chat_id, text)
 
+    @staticmethod
+    def _queue_filename(name: str) -> str:
+        name = str(name or "").strip()
+        if not name:
+            return "Unknown"
+        return name if len(name) <= 15 else name[:15] + "..."
+
+    def _queue_names(self, task: QueueTask) -> str:
+        if task.file_names is None:
+            return "Checking..."
+        if not task.file_names:
+            return "File names unavailable"
+
+        compact = [self._queue_filename(name) for name in task.file_names]
+        if len(compact) <= 3:
+            return ", ".join(compact)
+        return ", ".join(compact[:3]) + f" +{len(compact) - 3} more"
+
     def _queue_task_line(self, index: int, task: QueueTask) -> str:
-        file_label = (
-            "Checking file names…"
-            if task.file_names is None
-            else ", ".join(task.file_names)
-            if task.file_names
-            else "File names unavailable"
-        )
+        name_label = self._queue_names(task)
         if task.size_bytes and task.size_bytes > 0:
             size = format_bytes(task.size_bytes)
             if task.size_is_estimated:
                 size = "~" + size + " estimated"
         else:
             size = "Size unavailable"
-        return f"{index}. {file_label} ({size}) [{task.task_id[:8]}]"
+        return f"{index}. {size} — {name_label} [{task.task_id[:8]}]"
 
     async def _send_queue_command(self, chat_id: int):
         active = self.active_task
         active_line = "🔄 Now processing: Nothing"
         if active:
-            names = ", ".join(active.file_names or ["Working…"])
-            size = format_bytes(active.size_bytes or 0) if active.size_bytes else ""
+            names = self._queue_names(active)
+            size = format_bytes(active.size_bytes or 0) if active.size_bytes else "Size unavailable"
             active_line = (
-                f"🔄 Now processing: {names}"
-                + (f" ({size})" if size else "")
+                f"🔄 Now processing: {size} — {names}"
                 + f" [{active.task_id[:8]}]"
             )
 
