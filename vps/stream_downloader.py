@@ -88,6 +88,7 @@ async def download_m3u8_stream(
     fs_id: str = "",
     randsk: str = "",
     progress: ProgressCallback | None = None,
+    http_session: aiohttp.ClientSession | None = None,
 ) -> tuple[int, int]:
     """
     Port of the working TeraBox M3U8 downloader strategy.
@@ -126,17 +127,19 @@ async def download_m3u8_stream(
     )
     discovered: dict[int, tuple[str, int]] = {}
 
-    connector = aiohttp.TCPConnector(
-        limit=12,
-        limit_per_host=12,
-        ttl_dns_cache=300,
-        enable_cleanup_closed=True,
+    owned_session = http_session is None
+    session = http_session or aiohttp.ClientSession(
+        timeout=timeout,
+        connector=aiohttp.TCPConnector(
+            limit=16,
+            limit_per_host=16,
+            ttl_dns_cache=300,
+            keepalive_timeout=30,
+            enable_cleanup_closed=True,
+        ),
     )
 
-    async with aiohttp.ClientSession(
-        timeout=timeout,
-        connector=connector,
-    ) as session:
+    try:
         status, playlist = await _fetch_text(session, m3u8_url, headers)
         if status < 200 or status >= 300:
             raise RuntimeError(f"Failed to fetch M3U8 playlist: HTTP {status}")
@@ -158,9 +161,17 @@ async def download_m3u8_stream(
                 max_scan_time = 7200
 
             step = 25
-            empty_streak = 0
+            # The time probes are small requests. Fetch a few at once to avoid
+            # turning long videos into hundreds of serial 25-second API calls.
+            try:
+                probe_concurrency = max(
+                    1,
+                    min(8, int(os.getenv("HLS_PROBE_CONCURRENCY", "4"))),
+                )
+            except (TypeError, ValueError):
+                probe_concurrency = 4
 
-            for t in range(step, max_scan_time + 1, step):
+            async def probe_time(t: int) -> tuple[int, str]:
                 time_query = {
                     "app_id": "250528",
                     "web": "1",
@@ -178,27 +189,36 @@ async def download_m3u8_stream(
                     "ehps": "1",
                 }
                 time_url = "https://www.terabox.app/share/streaming?" + urlencode(time_query)
-
                 try:
-                    time_status, time_playlist = await _fetch_text(
-                        session,
-                        time_url,
-                        headers,
-                    )
-                    if time_status < 200 or time_status >= 300:
-                        continue
-
-                    before = len(discovered)
-                    discovered.update(_parse_segments(time_playlist, time_url))
-
-                    if len(discovered) > before:
-                        empty_streak = 0
-                    else:
-                        empty_streak += 1
-                        if not duration and empty_streak >= 4 and discovered:
-                            break
+                    return await _fetch_text(session, time_url, headers)
                 except Exception:
-                    continue
+                    return 0, ""
+
+            # Probe in bounded batches and keep the existing de-duplication
+            # semantics. Results are merged only after the batch is complete.
+            times = list(range(step, max_scan_time + 1, step))
+            for batch_start in range(0, len(times), probe_concurrency):
+                batch = times[batch_start : batch_start + probe_concurrency]
+                results = await asyncio.gather(
+                    *(probe_time(t) for t in batch),
+                    return_exceptions=True,
+                )
+                before = len(discovered)
+                for result in results:
+                    if isinstance(result, Exception):
+                        continue
+                    time_status, time_playlist = result
+                    if time_status < 200 or time_status >= 300 or not time_playlist:
+                        continue
+                    discovered.update(_parse_segments(time_playlist, m3u8_url))
+
+                # For streams where duration is missing, stop after a few
+                # consecutive empty batches once at least one segment is known.
+                if not duration and discovered and len(discovered) == before:
+                    # A batch is 4*25s by default; two empty batches means no
+                    # further timeline data was found.
+                    if batch_start >= probe_concurrency * step * 2:
+                        break
 
         indices = sorted(discovered)
         if not indices:
@@ -217,13 +237,10 @@ async def download_m3u8_stream(
             try:
                 concurrency = max(
                     1,
-                    min(
-                        8,
-                        int(os.getenv("HLS_SEGMENT_CONCURRENCY", "4")),
-                    ),
+                    min(8, int(os.getenv("HLS_SEGMENT_CONCURRENCY", "6"))),
                 )
             except (TypeError, ValueError):
-                concurrency = 4
+                concurrency = 6
 
             completed = 0
             progress_lock = asyncio.Lock()
@@ -231,26 +248,48 @@ async def download_m3u8_stream(
 
             async def fetch_segment(position: int, index: int) -> tuple[int, Path, int]:
                 nonlocal completed
-                segment_url, _ = discovered[index]
+                segment_url, declared_size = discovered[index]
                 part_path = segment_dir / f"{position:05d}.part.ts"
 
-                async with semaphore:
-                    async with session.get(
-                        segment_url,
-                        headers=headers,
-                        allow_redirects=True,
-                    ) as response:
-                        if response.status < 200 or response.status >= 300:
-                            raise RuntimeError(
-                                f"Failed to fetch segment {position}/{total_chunks}: "
-                                f"HTTP {response.status}"
-                            )
+                for attempt in range(4):
+                    async with semaphore:
+                        try:
+                            async with session.get(
+                                segment_url,
+                                headers=headers,
+                                allow_redirects=True,
+                            ) as response:
+                                if response.status < 200 or response.status >= 300:
+                                    raise RuntimeError(
+                                        f"HTTP {response.status}"
+                                    )
 
-                        segment_bytes = 0
-                        with part_path.open("wb") as part:
-                            async for chunk in response.content.iter_chunked(1024 * 1024):
-                                part.write(chunk)
-                                segment_bytes += len(chunk)
+                                segment_bytes = 0
+                                with part_path.open("wb") as part:
+                                    async for chunk in response.content.iter_chunked(4 * 1024 * 1024):
+                                        segment_bytes += len(chunk)
+                                        if segment_bytes > 256 * 1024 * 1024:
+                                            raise RuntimeError("HLS segment exceeded safety limit.")
+                                        part.write(chunk)
+
+                            if declared_size and segment_bytes < declared_size:
+                                raise RuntimeError(
+                                    f"short HLS segment: expected at least {declared_size}, got {segment_bytes}"
+                                )
+                            break
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            part_path.unlink(missing_ok=True)
+                            if attempt >= 3:
+                                raise
+                            await asyncio.sleep(0.35 * (2 ** attempt))
+                            log.debug(
+                                "HLS segment retry position=%s attempt=%s: %s",
+                                position,
+                                attempt + 1,
+                                exc,
+                            )
 
                 async with progress_lock:
                     completed += 1
@@ -262,11 +301,7 @@ async def download_m3u8_stream(
 
                 return position, part_path, segment_bytes
 
-            # The previous implementation downloaded chunks strictly one after
-            # another. TeraBox HLS chunks are independent, so several can be
-            # fetched simultaneously. We still concatenate them in index order,
-            # preserving the exact transport-stream sequence.
-            results = await asyncio.gather(
+            #             results = await asyncio.gather(
                 *(
                     fetch_segment(position, index)
                     for position, index in enumerate(indices, 1)
@@ -330,6 +365,10 @@ async def download_m3u8_stream(
             temp_output.unlink(missing_ok=True)
             import shutil
             shutil.rmtree(segment_dir, ignore_errors=True)
+
+    finally:
+        if owned_session:
+            await session.close()
 
     size = output_path.stat().st_size if output_path.exists() else 0
     if size <= 0:
