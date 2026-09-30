@@ -834,18 +834,18 @@ class Worker:
         name = str(name or "").strip()
         if not name:
             return "Unknown"
-        return name if len(name) <= 15 else name[:15] + "..."
+        # Keep queue entries compact enough to stay on one Telegram line.
+        return name if len(name) <= 12 else name[:12] + "..."
 
     def _queue_names(self, task: QueueTask) -> str:
         if task.file_names is None:
             return "Checking..."
         if not task.file_names:
-            return "File names unavailable"
+            return "Unknown"
 
-        compact = [self._queue_filename(name) for name in task.file_names]
-        if len(compact) <= 3:
-            return ", ".join(compact)
-        return ", ".join(compact[:3]) + f" +{len(compact) - 3} more"
+        first = self._queue_filename(task.file_names[0])
+        extra = len(task.file_names) - 1
+        return f"{first} +{extra} more" if extra else first
 
     def _queue_task_line(self, index: int, task: QueueTask) -> str:
         name_label = self._queue_names(task)
