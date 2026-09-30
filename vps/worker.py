@@ -656,6 +656,10 @@ class Worker:
         if not url or not is_terabox_url(url):
             return
 
+        if self._queue_position() >= MAX_QUEUE_SIZE:
+            await event.reply("⚠️ The download queue is full. Please try again later.")
+            return
+
         remaining_cooldown = self._check_duplicate_link(url)
         if remaining_cooldown is not None:
             minutes = max(1, math.ceil(remaining_cooldown / 60))
@@ -669,10 +673,6 @@ class Worker:
                 remaining_cooldown,
                 url,
             )
-            return
-
-        if self._queue_position() >= MAX_QUEUE_SIZE:
-            await event.reply("⚠️ The download queue is full. Please try again later.")
             return
 
         task = QueueTask(
