@@ -860,7 +860,7 @@ class Worker:
         active_line = "🔄 Now processing: Nothing"
         if active:
             names = self._queue_names(active)
-            size = format_bytes(active.size_bytes or 0) if active.size_bytes else "Size unavailable"
+            size = format_bytes(active.size_bytes or 0)
             active_line = (
                 f"🔄 Now processing: {size} — {names}"
                 + f" [{active.task_id[:8]}]"
