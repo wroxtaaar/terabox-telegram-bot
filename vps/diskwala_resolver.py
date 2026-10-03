@@ -452,8 +452,20 @@ class DiskwalaBrowserResolver:
                         flush=True,
                     )
 
+            def capture_request_failed(request):
+                url = _clean_url(request.url)
+                lower = url.lower()
+                if "/api/v1/file/" in lower:
+                    print(
+                        "Diskwala API request FAILED "
+                        + request.method + " " + url
+                        + " failure=" + str(request.failure),
+                        flush=True,
+                    )
+
             page.on("response", capture_response)
             page.on("request", capture_request)
+            page.on("requestfailed", capture_request_failed)
 
             try:
                 response = await page.goto(
@@ -934,6 +946,7 @@ class DiskwalaBrowserResolver:
                 try:
                     page.remove_listener("response", capture_response)
                     page.remove_listener("request", capture_request)
+                    page.remove_listener("requestfailed", capture_request_failed)
                 except Exception:
                     pass
                 await context.close()
