@@ -430,9 +430,9 @@ class DiskwalaBrowserResolver:
 
                 final_path = (urlparse(page.url).path or "").rstrip("/")
                 if final_path == "/404":
-                    raise RuntimeError(
-                        "Diskwala share URL resolved to the site's 404 page. "
-                        "The share may be expired, deleted, invalid, or no longer public."
+                    print(
+                        "Diskwala SPA route is /404; continuing with captured API responses",
+                        flush=True,
                     )
 
                 # Give the site's JS/WASM time to make temp_info and, when the
