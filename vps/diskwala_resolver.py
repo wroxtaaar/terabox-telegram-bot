@@ -328,6 +328,7 @@ class DiskwalaBrowserResolver:
                 device_scale_factor=1,
                 extra_http_headers={
                     "Accept-Language": "en-US,en;q=0.9",
+                    "Origin": "https://www.diskwala.com",
                 },
             )
             page = await context.new_page()
@@ -371,7 +372,9 @@ class DiskwalaBrowserResolver:
                         + str(record["request_method"])
                         + " " + record["url"]
                         + " status=" + str(record["status"])
-                        + " content_type=" + record["content_type"],
+                        + " content_type=" + record["content_type"]
+                        + " origin_present=" + str(bool(record["request_headers"].get("origin")))
+                        + " cookie_present=" + str(bool(record["request_headers"].get("cookie"))),
                         flush=True,
                     )
 
@@ -429,7 +432,9 @@ class DiskwalaBrowserResolver:
                         "Diskwala /file/temp_info response status="
                         + str(response.status)
                         + " keys="
-                        + json.dumps(safe_keys, ensure_ascii=False),
+                        + json.dumps(safe_keys, ensure_ascii=False)
+                        + " body="
+                        + json.dumps(body_text[:500], ensure_ascii=False),
                         flush=True,
                     )
                     if isinstance(parsed, dict):
