@@ -342,13 +342,19 @@ class DiskwalaBrowserResolver:
                     else:
                         api_sign_result.clear()
                         api_sign_result["raw"] = body_text[:10000]
-                    sign_url = _extract_any_url(parsed)
+                    sign_url = _extract_signed_media_url(parsed)
                     if sign_url:
                         api_sign_result["__signed_url"] = sign_url
                         sign_event.set()
+                    safe_sign = dict(api_sign_result)
+                    if safe_sign.get("__signed_url"):
+                        safe_sign["__signed_url"] = "<redacted>"
                     print(
-                        "Diskwala /file/sign response="
-                        + json.dumps(api_sign_result, ensure_ascii=False)[:16000],
+                        "Diskwala /file/sign response keys="
+                        + json.dumps(
+                            sorted(k for k in safe_sign.keys() if k != "raw"),
+                            ensure_ascii=False,
+                        ),
                         flush=True,
                     )
 
@@ -377,9 +383,9 @@ class DiskwalaBrowserResolver:
                         headers = request.headers
                     except Exception:
                         pass
-                    notable = {
-                        key: value
-                        for key, value in headers.items()
+                    notable_names = [
+                        key
+                        for key in headers
                         if key.lower() in {
                             "appicrypt",
                             "appicrypt-ts",
@@ -389,12 +395,14 @@ class DiskwalaBrowserResolver:
                             "cookie",
                             "content-type",
                         }
-                    }
+                    ]
                     print(
                         "Diskwala API request "
                         f"{request.method} {url} "
-                        f"headers={json.dumps(notable, ensure_ascii=False)[:3000]} "
-                        f"body={(request.post_data or '')[:2000]}",
+                        f"notable_headers={notable_names} "
+                        f"appicrypt_present={bool(headers.get('appicrypt'))} "
+                        f"appicrypt_ts_present={bool(headers.get('appicrypt-ts'))} "
+                        f"body_present={bool(request.post_data)}",
                         flush=True,
                     )
 
