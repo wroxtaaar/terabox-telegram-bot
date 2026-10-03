@@ -410,6 +410,9 @@ class DiskwalaBrowserResolver:
                         headers = request.headers
                     except Exception:
                         pass
+                    if headers.get("appicrypt"):
+                        last_api_request_headers.clear()
+                        last_api_request_headers.update(headers)
                     notable_names = [
                         key
                         for key in headers
