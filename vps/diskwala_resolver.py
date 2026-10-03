@@ -265,18 +265,27 @@ class DiskwalaBrowserResolver:
         async with self._semaphore:
             context = await self.browser.new_context(
                 user_agent=(
-                    "Mozilla/5.0 (X11; Linux x86_64) "
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/131.0.0.0 Safari/537.36"
+                    "Chrome/135.0.0.0 Safari/537.36"
                 ),
                 locale="en-US",
-                extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+                viewport={"width": 1280, "height": 900},
+                extra_http_headers={
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Origin": "https://www.diskwala.com",
+                },
             )
             page = await context.new_page()
 
             response_records: list[dict[str, Any]] = []
             request_urls: list[str] = []
             response_bodies: list[str] = []
+            api_sign_result: dict[str, Any] = {}
+            temp_info_result: dict[str, Any] = {}
+
+            sign_event = asyncio.Event()
+            temp_info_event = asyncio.Event()
 
             async def capture_response(response):
                 record = {
@@ -287,26 +296,107 @@ class DiskwalaBrowserResolver:
                     "content_disposition": response.headers.get(
                         "content-disposition", ""
                     ),
+                    "request_method": response.request.method,
+                    "request_headers": {},
+                    "request_body": response.request.post_data or "",
                 }
+                try:
+                    record["request_headers"] = await response.request.all_headers()
+                except Exception:
+                    record["request_headers"] = {}
+
                 response_records.append(record)
 
+                lower_url = record["url"].lower()
                 content_type = record["content_type"].lower()
-                if (
+
+                is_jsonish = (
                     "json" in content_type
-                    or "javascript" in content_type
-                    or "text/plain" in content_type
-                ):
-                    try:
-                        body = await response.text()
-                    except Exception:
-                        return
-                    if body and len(body) <= 500000:
-                        response_bodies.append(body)
+                    or lower_url.endswith(".json")
+                    or "/api/v1/file/" in lower_url
+                )
+
+                if not is_jsonish:
+                    return
+
+                try:
+                    body_text = await response.text()
+                except Exception:
+                    return
+
+                if not body_text:
+                    return
+
+                if len(body_text) <= 1000000:
+                    response_bodies.append(body_text)
+
+                try:
+                    parsed = json.loads(body_text)
+                except Exception:
+                    parsed = None
+
+                if "/api/v1/file/sign" in lower_url and response.status == 200:
+                    if isinstance(parsed, dict):
+                        api_sign_result.clear()
+                        api_sign_result.update(parsed)
+                    else:
+                        api_sign_result.clear()
+                        api_sign_result["raw"] = body_text[:10000]
+                    sign_url = _extract_any_url(parsed)
+                    if sign_url:
+                        api_sign_result["__signed_url"] = sign_url
+                        sign_event.set()
+                    print(
+                        "Diskwala /file/sign response="
+                        + json.dumps(api_sign_result, ensure_ascii=False)[:16000],
+                        flush=True,
+                    )
+
+                if "/api/v1/file/temp_info" in lower_url and response.status == 200:
+                    if isinstance(parsed, dict):
+                        temp_info_result.clear()
+                        temp_info_result.update(parsed)
+                    if isinstance(parsed, dict):
+                        temp_info_result["__filename"] = (
+                            _first_filename(parsed)
+                        )
+                        temp_info_result["__size"] = (
+                            _first_size(parsed)
+                        )
+                    temp_info_event.set()
 
             def capture_request(request):
                 url = _clean_url(request.url)
                 if url and url not in request_urls:
                     request_urls.append(url)
+
+                lower = url.lower()
+                if "/api/v1/file/" in lower:
+                    headers = {}
+                    try:
+                        headers = request.headers
+                    except Exception:
+                        pass
+                    notable = {
+                        key: value
+                        for key, value in headers.items()
+                        if key.lower() in {
+                            "appicrypt",
+                            "appicrypt-ts",
+                            "authorization",
+                            "origin",
+                            "referer",
+                            "cookie",
+                            "content-type",
+                        }
+                    }
+                    print(
+                        "Diskwala API request "
+                        f"{request.method} {url} "
+                        f"headers={json.dumps(notable, ensure_ascii=False)[:3000]} "
+                        f"body={(request.post_data or '')[:2000]}",
+                        flush=True,
+                    )
 
             page.on("response", capture_response)
             page.on("request", capture_request)
@@ -315,7 +405,7 @@ class DiskwalaBrowserResolver:
                 response = await page.goto(
                     share_url,
                     wait_until="domcontentloaded",
-                    timeout=30000,
+                    timeout=45000,
                 )
                 if response:
                     print(
@@ -323,14 +413,12 @@ class DiskwalaBrowserResolver:
                         flush=True,
                     )
 
+                # Diskwala is a React SPA. A 200 initial response can still
+                # redirect the SPA to /404 for an invalid/deleted share.
                 try:
-                    await page.wait_for_load_state("networkidle", timeout=8000)
+                    await page.wait_for_timeout(1500)
                 except Exception:
                     pass
-
-                # Give the app/player JavaScript time to populate metadata and
-                # request its media URL.
-                await page.wait_for_timeout(2500)
 
                 final_path = (urlparse(page.url).path or "").rstrip("/")
                 if final_path == "/404":
@@ -339,14 +427,166 @@ class DiskwalaBrowserResolver:
                         "The share may be expired, deleted, invalid, or no longer public."
                     )
 
+                # Give the site's JS/WASM time to make temp_info and, when the
+                # public player automatically prepares the file, sign requests.
                 try:
-                    await page.locator("video, audio").first.evaluate(
-                        "(el) => { el.muted = true; return el.play().catch(() => null); }"
+                    await asyncio.wait_for(
+                        temp_info_event.wait(),
+                        timeout=8.0,
                     )
-                    await page.wait_for_timeout(1200)
-                except Exception:
+                except asyncio.TimeoutError:
                     pass
 
+                try:
+                    await asyncio.wait_for(
+                        sign_event.wait(),
+                        timeout=5.0,
+                    )
+                except asyncio.TimeoutError:
+                    pass
+
+                await page.wait_for_timeout(1500)
+
+                # Some builds only sign the download after the user clicks a
+                # play/download control. Never click the site's global
+                # "Download App" navigation.
+                if not api_sign_result.get("__signed_url"):
+                    try:
+                        controls = await page.evaluate(
+                            """
+                            () => Array.from(
+                              document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]')
+                            )
+                            .filter((el) => {
+                              const r = el.getBoundingClientRect();
+                              const s = getComputedStyle(el);
+                              return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+                            })
+                            .slice(0, 80)
+                            .map((el) => ({
+                              tag: el.tagName,
+                              text: (el.innerText || el.value || '').trim().replace(/\\s+/g, ' ').slice(0, 160),
+                              aria: el.getAttribute('aria-label') || '',
+                              title: el.getAttribute('title') || '',
+                              href: el.href || '',
+                              cls: String(el.className || '').slice(0, 200)
+                            }))
+                            """
+                        )
+                    except Exception:
+                        controls = []
+
+                    print(
+                        "Diskwala visible controls="
+                        + json.dumps(controls, ensure_ascii=False)[:16000],
+                        flush=True,
+                    )
+
+                    for control_index, control in enumerate(controls):
+                        if api_sign_result.get("__signed_url"):
+                            break
+
+                        text_value = " ".join(
+                            str(control.get(key) or "")
+                            for key in ("text", "aria", "title", "href", "cls")
+                        ).lower()
+
+                        if any(
+                            bad in text_value
+                            for bad in (
+                                "download app",
+                                "get the app",
+                                "download the app",
+                                "google play",
+                                "app store",
+                                "youtube",
+                                "telegram",
+                                "privacy",
+                                "terms",
+                                "contact",
+                                "#download",
+                            )
+                        ):
+                            continue
+
+                        looks_relevant = any(
+                            token in text_value
+                            for token in (
+                                "download",
+                                "play",
+                                "watch",
+                                "open",
+                                "video",
+                                "file",
+                            )
+                        )
+                        if not looks_relevant:
+                            continue
+
+                        try:
+                            locator = page.locator(
+                                "button, a, [role='button'], input[type='button'], input[type='submit']"
+                            ).nth(control_index)
+                            if not await locator.is_visible():
+                                continue
+
+                            print(
+                                "Diskwala resolver: clicking candidate "
+                                + json.dumps(control, ensure_ascii=False)[:1000],
+                                flush=True,
+                            )
+                            await locator.click(
+                                timeout=5000,
+                                force=True,
+                            )
+                            try:
+                                await asyncio.wait_for(
+                                    sign_event.wait(),
+                                    timeout=5.0,
+                                )
+                            except asyncio.TimeoutError:
+                                pass
+                            await page.wait_for_timeout(750)
+                        except Exception:
+                            continue
+
+                signed_url = str(api_sign_result.get("__signed_url") or "").strip()
+
+                # If Diskwala exposed a signed URL through its first-party API,
+                # prefer it over heuristic HTML/network candidates.
+                if signed_url:
+                    filename = (
+                        str(temp_info_result.get("__filename") or "").strip()
+                        or _filename_from_url(signed_url)
+                        or "diskwala-file"
+                    )
+                    size = int(temp_info_result.get("__size") or 0)
+                    if "." not in Path(filename).name and _filename_from_url(
+                        signed_url
+                    ):
+                        filename = _filename_from_url(signed_url)
+
+                    cookies = "; ".join(
+                        f"{cookie['name']}={cookie['value']}"
+                        for cookie in await page.context.cookies()
+                    )
+                    elapsed = round((time.monotonic() - started) * 1000)
+                    return self._build_result(
+                        share_url=share_url,
+                        page=page,
+                        filename=filename,
+                        size=size,
+                        direct_url=signed_url,
+                        stream_url="",
+                        browser_download_path="",
+                        download_mode="direct",
+                        share_id=extract_diskwala_id(share_url),
+                        cookies=cookies,
+                        elapsed=elapsed,
+                    )
+
+                # Fall back to the earlier generic extraction logic for older
+                # layouts or pages that expose a stream directly.
                 dom_data = await page.evaluate(
                     """
                     () => ({
@@ -392,7 +632,10 @@ class DiskwalaBrowserResolver:
                     source: str = "",
                 ):
                     url = _clean_url(url)
-                    if not url.startswith(("http://", "https://")) or _is_bad_asset(url):
+                    if (
+                        not url.startswith(("http://", "https://"))
+                        or _is_bad_asset(url)
+                    ):
                         return
 
                     current = candidates.get(url)
@@ -447,7 +690,7 @@ class DiskwalaBrowserResolver:
 
                     disposition = str(item.get("content_disposition") or "")
                     match = re.search(
-                        r"filename\*?=(?:UTF-8'')?[\"']?([^;\"']+)",
+                        r"filename\\*?=(?:UTF-8'')?[\"']?([^;\"']+)",
                         disposition,
                         re.IGNORECASE,
                     )
@@ -469,8 +712,6 @@ class DiskwalaBrowserResolver:
                 for url in performance_urls[-300:]:
                     add_candidate(url, source="performance")
 
-                # Diskwala may keep the CDN URL in a JS bootstrap object rather
-                # than putting it directly on the video element.
                 for match in URL_RE.findall(normalized_html):
                     add_candidate(match, source="html")
 
@@ -566,6 +807,15 @@ class DiskwalaBrowserResolver:
                         "title": dom_data.get("title", ""),
                         "final_url": page.url,
                         "candidate_count": len(candidates),
+                        "api_requests": [
+                            {
+                                "url": item["url"],
+                                "method": item.get("request_method"),
+                                "request_body": item.get("request_body"),
+                            }
+                            for item in response_records
+                            if "/api/v1/file/" in item["url"].lower()
+                        ],
                         "top_candidates": [
                             {
                                 "url": item["url"].split("?", 1)[0][:240],
@@ -579,16 +829,17 @@ class DiskwalaBrowserResolver:
                             }
                             for item in scored[:20]
                         ],
-                        "body": str(dom_data.get("bodyText") or "")[:800],
+                        "body": str(dom_data.get("bodyText") or "")[:1200],
                     }
                     print(
                         "Diskwala resolver diagnostics="
-                        + json.dumps(diagnostics, ensure_ascii=False)[:12000],
+                        + json.dumps(diagnostics, ensure_ascii=False)[:20000],
                         flush=True,
                     )
                     raise RuntimeError(
-                        "Diskwala page loaded, but no direct media URL was exposed. "
-                        "The public link may have download protection or an unsupported page layout."
+                        "Diskwala page did not expose a signed media URL. "
+                        "The share may be invalid/private, or this Diskwala page "
+                        "requires an interaction not yet supported by the resolver."
                     )
 
                 filename = (
