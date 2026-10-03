@@ -174,18 +174,12 @@ class DiskwalaResolver:
         if self.playwright:
             await self.playwright.stop()
 
-    async def _proxy_api(self, route: Route):
+    async def _proxy_api(self, route: Route, api_context):
         request = route.request
         url = request.url
         headers = await request.all_headers()
         for key in ("host", "content-length", "connection", "accept-encoding"):
             headers.pop(key, None)
-
-        context = route.request._impl_obj._parent._parent
-        api_context = getattr(context, "request", None)
-        if api_context is None:
-            await route.continue_()
-            return
 
         try:
             response = await api_context.fetch(
@@ -268,7 +262,7 @@ class DiskwalaResolver:
             downloads.append(download)
 
         try:
-            await context.route(f"**://{DISKWALA_API_HOST}/api/v1/**", self._proxy_api)
+            await context.route(\n                f"**://{DISKWALA_API_HOST}/api/v1/**",\n                lambda route: self._proxy_api(route, context.request),\n            )
             page: Page = await context.new_page()
             page.on("response", on_response)
             page.on("requestfailed", on_request_failed)
