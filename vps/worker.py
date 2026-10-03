@@ -458,7 +458,7 @@ class Worker:
 
         log.info("Starting Chromium resolver...")
         await self.resolver.start()
-        await self.diskwala_resolver.start(self.resolver.browser)
+        await self.diskwala_resolver.start()
 
         self.http_session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=None, connect=20, sock_read=120),
