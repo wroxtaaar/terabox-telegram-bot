@@ -471,7 +471,8 @@ class DiskwalaBrowserResolver:
                               return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
                             })
                             .slice(0, 80)
-                            .map((el) => ({
+                            .map((el, index) => ({
+                              index,
                               tag: el.tagName,
                               text: (el.innerText || el.value || '').trim().replace(/\\s+/g, ' ').slice(0, 160),
                               aria: el.getAttribute('aria-label') || '',
@@ -534,7 +535,7 @@ class DiskwalaBrowserResolver:
                         try:
                             locator = page.locator(
                                 "button, a, [role='button'], input[type='button'], input[type='submit']"
-                            ).nth(control_index)
+                            ).nth(int(control.get("index") or control_index))
                             if not await locator.is_visible():
                                 continue
 
@@ -579,15 +580,16 @@ class DiskwalaBrowserResolver:
                         for cookie in await page.context.cookies()
                     )
                     elapsed = round((time.monotonic() - started) * 1000)
+                    signed_is_hls = _is_hls(signed_url)
                     return self._build_result(
                         share_url=share_url,
                         page=page,
                         filename=filename,
                         size=size,
-                        direct_url=signed_url,
-                        stream_url="",
+                        direct_url="" if signed_is_hls else signed_url,
+                        stream_url=signed_url if signed_is_hls else "",
                         browser_download_path="",
-                        download_mode="direct",
+                        download_mode="stream" if signed_is_hls else "direct",
                         share_id=extract_diskwala_id(share_url),
                         cookies=cookies,
                         elapsed=elapsed,
