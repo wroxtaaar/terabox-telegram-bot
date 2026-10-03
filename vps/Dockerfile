@@ -15,6 +15,7 @@ RUN apt-get update \
     && python -m playwright install --with-deps chromium
 
 COPY browser_resolver.py ./vps/browser_resolver.py
+COPY diskwala_resolver.py ./vps/diskwala_resolver.py
 COPY stream_downloader.py ./vps/stream_downloader.py
 COPY splitter.py ./vps/splitter.py
 COPY worker.py ./vps/worker.py
