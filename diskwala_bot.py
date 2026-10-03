@@ -306,6 +306,68 @@ class DiskwalaResolver:
                         special,
                         names,
                     )
+
+                    # Chromium reaches the API with the genuine Appicrypt headers,
+                    # but the VPS Chromium network returns ERR_FAILED. Capture the
+                    # legitimate request and replay it outside Chromium. Values are
+                    # kept in memory only and are never logged.
+                    replay_headers = dict(headers)
+                    for key in ("host", "content-length", "connection", "accept-encoding"):
+                        replay_headers.pop(key, None)
+                    body = request.post_data_buffer if request.post_data_buffer is not None else None
+                    try:
+                        timeout = aiohttp.ClientTimeout(total=30)
+                        async with aiohttp.ClientSession(timeout=timeout) as session:
+                            async with session.request(
+                                request.method,
+                                request.url,
+                                headers=replay_headers,
+                                data=body,
+                                allow_redirects=True,
+                            ) as api_response:
+                                api_body = await api_response.read()
+                                api_payload = parse_json_body(api_body)
+                                if api_response.status < 400:
+                                    if api_payload is not None:
+                                        for _, media_url, _ in extract_candidates(api_payload):
+                                            if media_url not in media_urls:
+                                                media_urls.append(media_url)
+                                                log.info(
+                                                    "DiskWala replay discovered media URL "
+                                                    "from %s",
+                                                    urlparse(request.url).path,
+                                                )
+                                        api_payloads.append((request.url, api_payload))
+                                    else:
+                                        log.info(
+                                            "DiskWala replay response was non-JSON "
+                                            "status=%s content_type=%s bytes=%d",
+                                            api_response.status,
+                                            api_response.headers.get("content-type", ""),
+                                            len(api_body),
+                                        )
+                                else:
+                                    log.warning(
+                                        "DiskWala replay API %s %s -> %s "
+                                        "content_type=%s bytes=%d body=%r",
+                                        request.method,
+                                        urlparse(request.url).path,
+                                        api_response.status,
+                                        api_response.headers.get("content-type", ""),
+                                        len(api_body),
+                                        (
+                                            api_body.decode("utf-8", "replace")[:200]
+                                            if len(api_body) <= 200
+                                            else ""
+                                        ),
+                                    )
+                    except Exception as exc:
+                        log.warning(
+                            "DiskWala replay request failed %s %s: %s",
+                            request.method,
+                            urlparse(request.url).path,
+                            exc,
+                        )
                 except Exception as exc:
                     log.debug("DiskWala request diagnostics failed: %s", exc)
 
