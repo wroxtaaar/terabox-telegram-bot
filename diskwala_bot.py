@@ -190,7 +190,7 @@ class DiskwalaResolver:
                 timeout=30000,
                 fail_on_status_code=False,
             )
-            response_headers = await response.all_headers()
+            response_headers = dict(response.headers)
             response_headers.pop("content-encoding", None)
             response_headers.pop("content-length", None)
             response_headers["access-control-allow-origin"] = DISKWALA_ORIGIN
