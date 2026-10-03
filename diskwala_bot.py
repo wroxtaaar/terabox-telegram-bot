@@ -196,10 +196,43 @@ class DiskwalaResolver:
             response_headers["access-control-allow-origin"] = DISKWALA_ORIGIN
             response_headers["access-control-allow-credentials"] = "true"
             response_body = await response.body()
-            log.info(
-                "proxied DiskWala API %s %s -> %s bytes=%d",
-                request.method, url, response.status, len(response_body),
+
+            # Safe diagnostics: never log cookies, authorization, Appicrypt values, or
+            # request bodies. These fields are enough to see why the API rejects us.
+            request_header_names = sorted(
+                k.lower() for k in headers.keys()
+                if k.lower() not in {"cookie", "authorization", "appicrypt", "appicrypt-ts"}
             )
+            response_content_type = response.headers.get("content-type", "")
+            safe_body = ""
+            if response.status >= 400:
+                decoded = response_body.decode("utf-8", "replace").strip()
+                if len(decoded) <= 200 and not any(
+                    marker in decoded.lower()
+                    for marker in ("token", "cookie", "appicrypt", "authorization", "secret")
+                ):
+                    safe_body = decoded
+
+            log.info(
+                "proxied DiskWala API %s %s -> %s bytes=%d content_type=%s",
+                request.method, url, response.status, len(response_body), response_content_type,
+            )
+            log.info(
+                "DiskWala API request diagnostics method=%s path=%s "
+                "origin=%s referer=%s header_names=%s",
+                request.method,
+                urlparse(url).path,
+                headers.get("origin", ""),
+                headers.get("referer", ""),
+                request_header_names,
+            )
+            if response.status >= 400:
+                log.warning(
+                    "DiskWala API error diagnostics status=%s content_type=%s body=%r",
+                    response.status,
+                    response_content_type,
+                    safe_body,
+                )
             await route.fulfill(
                 status=response.status,
                 headers=response_headers,
