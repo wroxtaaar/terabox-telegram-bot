@@ -25,6 +25,7 @@ from telethon.errors import FloodWaitError
 from telethon.sessions import SQLiteSession
 
 from .browser_resolver import TeraBoxBrowserResolver
+from .diskwala_resolver import DiskwalaBrowserResolver, is_diskwala_url
 from .splitter import MAX_TELEGRAM_FILE_SIZE, split_binary_file, split_video
 from .stream_downloader import download_m3u8_stream
 
@@ -34,6 +35,12 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 log = logging.getLogger("terabox-vps-worker")
+
+
+DISKWALA_HOSTS = {
+    "diskwala.com",
+    "www.diskwala.com",
+}
 
 
 TERABOX_HOSTS = {
@@ -90,6 +97,14 @@ VIDEO_EXTENSIONS = {
     ".ts",
     ".flv",
 }
+
+def is_supported_url(value: str) -> bool:
+    return is_terabox_url(value) or is_diskwala_url(value)
+
+
+def source_name(value: str) -> str:
+    return "Diskwala" if is_diskwala_url(value) else "TeraBox"
+
 
 MAX_QUEUE_SIZE = int(os.getenv("MAX_QUEUE_SIZE", "100"))
 MAX_FILES_PER_LINK = int(os.getenv("MAX_FILES_PER_LINK", "25"))
@@ -252,6 +267,9 @@ class Worker:
         # Inspect metadata concurrently so the ready-download queue fills
         # quickly while the single active download runs independently.
         self.resolver = TeraBoxBrowserResolver(max_concurrent=2)
+        # Reuse the same Chromium instance for Diskwala to avoid a second
+        # browser process on the 2-core Oracle VPS.
+        self.diskwala_resolver = DiskwalaBrowserResolver(max_concurrent=1)
 
         self.size_inspection_queue: list[QueueTask] = []
         # Min-heap ordered by file size, then enqueue time, then task id.
@@ -493,6 +511,7 @@ class Worker:
 
         log.info("Starting Chromium resolver...")
         await self.resolver.start()
+        await self.diskwala_resolver.start(self.resolver.browser)
 
         self.http_session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=None, connect=20, sock_read=120),
@@ -547,6 +566,7 @@ class Worker:
             await self.http_session.close()
         self.http_session = None
 
+        await self.diskwala_resolver.stop()
         await self.resolver.stop()
 
     async def _delete_bot_api_webhook(self):
@@ -644,9 +664,9 @@ class Worker:
 
         if command == "/start":
             await event.reply(
-                "👋 TeraBox Downloader Bot Active\n\n"
-                "Send me any supported TeraBox share link and I will download "
-                "the files and deliver them here.\n\n"
+                "👋 TeraBox / Diskwala Downloader Bot Active\n\n"
+                "Send me a public TeraBox or Diskwala share link and I will download "
+                "the available file and deliver it here.\n\n"
                 "Commands:\n"
                 "/queue — current download queue\n"
                 "/space — server storage\n"
@@ -659,7 +679,7 @@ class Worker:
         if command == "/help":
             await event.reply(
                 "📖 Help\n\n"
-                "1. Paste a TeraBox share link.\n"
+                "1. Paste a public TeraBox or Diskwala share link.\n"
                 "2. The bot inspects file names and sizes in the background.\n"
                 "3. Downloading starts as soon as a task is sized; ready tasks are processed smallest-first.\n"
                 "4. ZIP archives are unpacked automatically.\n"
@@ -693,7 +713,7 @@ class Worker:
             return
 
         url = extract_url_from_text(text)
-        if not url or not is_terabox_url(url):
+        if not url or not is_supported_url(url):
             return
 
         if self._queue_position() >= MAX_QUEUE_SIZE:
@@ -704,11 +724,11 @@ class Worker:
         if remaining_cooldown is not None:
             minutes = max(1, math.ceil(remaining_cooldown / 60))
             await event.reply(
-                f"⏳ This TeraBox link was already submitted recently. "
+                f"⏳ This {source_name(url)} link was already submitted recently. "
                 f"Please wait about {minutes} minute{'s' if minutes != 1 else ''} before sending it again."
             )
             log.info(
-                "telegram duplicate link rejected chat_id=%s cooldown_remaining=%ss url=%s",
+                "telegram duplicate %s link rejected chat_id=%s cooldown_remaining=%ss url=%s",
                 chat_id,
                 remaining_cooldown,
                 url,
@@ -725,7 +745,7 @@ class Worker:
 
         position = self._queue_position()
         await event.reply(
-            f"📋 Queued your TeraBox link.\n"
+            f"📋 Queued your {source_name(url)} link.\n"
             f"Job/task: {task.task_id[:8]}\n"
             f"Queue position: {position}\n\n"
             f"🔎 First checking file names and sizes…",
@@ -733,7 +753,7 @@ class Worker:
         )
 
         log.info(
-            "telegram message accepted task=%s chat_id=%s queue_size_before=%s url=%s",
+            "telegram %s message accepted task=%s chat_id=%s queue_size_before=%s url=%s",
             task.task_id,
             chat_id,
             position - 1,
@@ -913,14 +933,28 @@ class Worker:
         )
         await self.telegram.send_message(chat_id, text)
 
+    async def _resolve_url(self, url: str, *, allow_native_download: bool = True) -> dict:
+        if is_diskwala_url(url):
+            return await self.diskwala_resolver.resolve(
+                url,
+                allow_native_download=allow_native_download,
+            )
+        if is_terabox_url(url):
+            return await self.resolver.resolve(
+                url,
+                allow_native_download=allow_native_download,
+            )
+        raise ValueError("Unsupported download URL.")
+
     # ---------- size inspection ----------
 
     async def _inspect_one_task(self, task: QueueTask) -> None:
         """Inspect one link and promote it immediately when metadata is ready."""
         self.inspecting_task = task
         try:
-            log.info("task=%s inspecting TeraBox metadata", task.task_id)
-            metadata = await self.resolver.resolve(
+            src = source_name(task.url)
+            log.info("task=%s inspecting %s metadata", task.task_id, src)
+            metadata = await self._resolve_url(
                 task.url,
                 allow_native_download=False,
             )
@@ -1057,14 +1091,16 @@ class Worker:
         unpack_dir.mkdir(parents=True, exist_ok=True)
 
         link_counter = self._link_counter_text(task.url)
+        src = source_name(task.url)
         job = {
             "id": job_id,
             "taskId": task.task_id,
             "url": task.url,
+            "source": src,
             "linkCounter": self._link_counter(task.url),
             "status": "resolving",
             "progress": 10,
-            "statusText": "Analyzing TeraBox share link...",
+            "statusText": f"Analyzing {src} share link...",
             "files": [],
             "chatId": str(task.chat_id),
             "retryCount": task.retry_count,
@@ -1081,13 +1117,13 @@ class Worker:
         await self._status(
             job,
             task,
-            "🔎 Checking your TeraBox link…",
+            f"🔎 Checking your {src} link…",
         )
 
         try:
             job["status"] = "resolving"
             self._save_jobs()
-            resolved = await self.resolver.resolve(task.url, allow_native_download=True)
+            resolved = await self._resolve_url(task.url, allow_native_download=True)
             files = [
                 item for item in (resolved.get("files") or [])
                 if isinstance(item, dict) and not item.get("is_dir")
@@ -1486,10 +1522,10 @@ class Worker:
                                 )
                             output.write(chunk)
                     if total <= 0:
-                        raise RuntimeError("TeraBox direct URL returned an empty file.")
+                        raise RuntimeError("Resolved direct URL returned an empty file.")
                     if expected_size and total != expected_size:
                         raise RuntimeError(
-                            f"TeraBox download size mismatch: expected {expected_size} bytes, received {total} bytes."
+                            f"Direct download size mismatch: expected {expected_size} bytes, received {total} bytes."
                         )
                     return path, total
 
@@ -1647,7 +1683,7 @@ class Worker:
         # destination and will atomically create/replace it after remuxing.
         # Pre-creating a zero-byte output can cause inconsistent behavior on
         # some FFmpeg/filesystem combinations.
-        output_name = f"terabox-hls-{task.task_id}-{uuid.uuid4().hex}{suffix}"
+        output_name = f"hls-{task.task_id}-{uuid.uuid4().hex}{suffix}"
         path = active_dir / output_name
 
         last_status = 0.0
