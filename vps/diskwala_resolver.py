@@ -530,6 +530,11 @@ class DiskwalaBrowserResolver:
 
                 share_id = extract_diskwala_id(share_url)
 
+                cookies = "; ".join(
+                    f"{cookie['name']}={cookie['value']}"
+                    for cookie in await page.context.cookies()
+                )
+
                 if browser_download_path:
                     size = os.path.getsize(browser_download_path)
                     filename = browser_filename or Path(browser_download_path).name
@@ -544,6 +549,7 @@ class DiskwalaBrowserResolver:
                         browser_download_path=browser_download_path,
                         download_mode="browser",
                         share_id=share_id,
+                        cookies=cookies,
                         elapsed=elapsed,
                     )
 
@@ -601,6 +607,7 @@ class DiskwalaBrowserResolver:
                     browser_download_path="",
                     download_mode="direct" if direct else "stream",
                     share_id=share_id,
+                    cookies=cookies,
                     elapsed=elapsed,
                 )
             finally:
@@ -738,6 +745,7 @@ class DiskwalaBrowserResolver:
         browser_download_path: str,
         download_mode: str,
         share_id: str,
+        cookies: str,
         elapsed: int,
     ) -> dict[str, Any]:
         return {
@@ -755,7 +763,7 @@ class DiskwalaBrowserResolver:
             "share_id": share_id,
             "uk": "",
             "duration": 0,
-            "cookies": "",
+            "cookies": cookies,
             "referer_url": page.url,
             "files": [{
                 "file_name": filename,
