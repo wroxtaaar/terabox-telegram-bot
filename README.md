@@ -7,7 +7,7 @@ The application now runs entirely on the Oracle VPS.
 Telegram user
 → Telethon MTProto bot on Oracle
 → Playwright + Chromium on Oracle
-→ TeraBox
+→ TeraBox or Diskwala
 → temporary VPS disk
 → Telethon MTProto upload
 → Telegram
@@ -26,9 +26,11 @@ Everything is inside the vps/ stack:
 
 Telegram updates are consumed directly by Telethon on the VPS. No Telegram webhook or Render controller is required.
 
+Diskwala support uses the public share page in the existing Chromium instance. No Diskwala API key or paid third-party resolver is required.
+
 The health endpoint is bound to the VPS loopback through Docker port mapping: 127.0.0.1:18080.
 
-The worker processes one Chromium resolution at a time, which is appropriate for the 2-core Oracle instance.
+TeraBox metadata inspection can use two resolver slots. Diskwala uses one shared-browser slot to keep resource usage appropriate for the 2-core Oracle instance.
 
 ## Oracle deployment
 
@@ -92,9 +94,9 @@ Required GitHub repository secrets:
 
 ## Telegram behavior
 
-Send the bot /start, /help, or a TeraBox share URL.
+Send the bot /start, /help, a TeraBox share URL, or a public Diskwala share URL.
 
-The bot queues the link, resolves it in Chromium, downloads the file to /tmp, uploads it to Telegram with MTProto, and removes the temporary file.
+The bot queues the link, resolves it in Chromium, downloads the file to /tmp, uploads it to Telegram with MTProto, and removes the temporary file. Diskwala resolution reuses the same Chromium browser.
 
 No long-lived TeraBox ndus cookie is required.
 
