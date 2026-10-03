@@ -1236,14 +1236,23 @@ class Worker:
                     if downloaded_path is None and source.get("stream_url"):
                         if not candidate_name.lower().endswith(".mp4"):
                             candidate_name = re.sub(r"\.[^.]+$", "", candidate_name) + ".mp4"
-                        downloaded_path, _ = await self._download_hls(
-                            job,
-                            task,
-                            str(source["stream_url"]),
-                            candidate_name,
-                            resolved,
-                            source,
-                        )
+                        if src == "Diskwala":
+                            downloaded_path, _ = await self._download_generic_hls(
+                                job,
+                                task,
+                                str(source["stream_url"]),
+                                candidate_name,
+                                resolved,
+                            )
+                        else:
+                            downloaded_path, _ = await self._download_hls(
+                                job,
+                                task,
+                                str(source["stream_url"]),
+                                candidate_name,
+                                resolved,
+                                source,
+                            )
                         used_hls = True
 
                     if downloaded_path is None:
@@ -1664,6 +1673,82 @@ class Worker:
                     f"TeraBox download size mismatch: expected {expected_size} bytes, received {total} bytes."
                 )
             return path, total
+        except Exception:
+            path.unlink(missing_ok=True)
+            raise
+
+    async def _download_generic_hls(
+        self,
+        job: dict,
+        task: QueueTask,
+        stream_url: str,
+        filename: str,
+        resolved: dict,
+    ) -> tuple[Path, int]:
+        """Download a generic signed HLS manifest (used for Diskwala).
+
+        Diskwala HLS URLs are normal signed manifests; they do not carry the
+        TeraBox-specific shareid/uk/sign/timestamp parameters expected by
+        download_m3u8_stream().
+        """
+        active_dir = DOWNLOADS_DIR / "active"
+        active_dir.mkdir(parents=True, exist_ok=True)
+        suffix = Path(filename).suffix or ".mp4"
+        output_name = f"hls-{task.task_id}-{uuid.uuid4().hex}{suffix}"
+        path = active_dir / output_name
+
+        referer = str(resolved.get("referer_url") or "https://www.diskwala.com/")
+        cookies = str(resolved.get("cookies") or "")
+        headers = (
+            f"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            f"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36\r\n"
+            f"Referer: {referer}\r\n"
+        )
+        if cookies:
+            headers += f"Cookie: {cookies}\r\n"
+
+        await self._status(
+            job,
+            task,
+            f"⬇️ Downloading {filename} (HLS)…",
+            progress=35,
+        )
+
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel", "error",
+            "-y",
+            "-headers", headers,
+            "-i", stream_url,
+            "-c", "copy",
+            "-movflags", "+faststart",
+            str(path),
+        ]
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _stdout, stderr = await process.communicate()
+            if process.returncode != 0:
+                detail = (stderr or b"").decode(errors="ignore").strip()
+                raise RuntimeError(
+                    f"FFmpeg HLS download failed with code {process.returncode}: "
+                    f"{detail[-1000:]}"
+                )
+            if not path.exists():
+                raise RuntimeError("FFmpeg completed but the output file is missing.")
+            size = path.stat().st_size
+            if size <= 0:
+                raise RuntimeError("FFmpeg produced an empty HLS output.")
+            if size > MAX_DOWNLOAD_BYTES:
+                raise RuntimeError(
+                    f"File exceeds MAX_DOWNLOAD_BYTES ({MAX_DOWNLOAD_BYTES})."
+                )
+            return path, size
         except Exception:
             path.unlink(missing_ok=True)
             raise
