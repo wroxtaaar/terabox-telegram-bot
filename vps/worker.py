@@ -729,6 +729,7 @@ class Worker:
             )
             log.info(
                 "telegram duplicate %s link rejected chat_id=%s cooldown_remaining=%ss url=%s",
+                source_name(url),
                 chat_id,
                 remaining_cooldown,
                 url,
@@ -754,6 +755,7 @@ class Worker:
 
         log.info(
             "telegram %s message accepted task=%s chat_id=%s queue_size_before=%s url=%s",
+            source_name(url),
             task.task_id,
             chat_id,
             position - 1,
