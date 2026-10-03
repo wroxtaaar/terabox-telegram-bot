@@ -262,7 +262,10 @@ class DiskwalaResolver:
             downloads.append(download)
 
         try:
-            await context.route(\n                f"**://{DISKWALA_API_HOST}/api/v1/**",\n                lambda route: self._proxy_api(route, context.request),\n            )
+            await context.route(
+                f"**://{DISKWALA_API_HOST}/api/v1/**",
+                lambda route: self._proxy_api(route, context.request),
+            )
             page: Page = await context.new_page()
             page.on("response", on_response)
             page.on("requestfailed", on_request_failed)
