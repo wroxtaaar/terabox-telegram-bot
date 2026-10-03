@@ -19,7 +19,7 @@ COPY diskwala_resolver.py ./vps/diskwala_resolver.py
 COPY stream_downloader.py ./vps/stream_downloader.py
 COPY splitter.py ./vps/splitter.py
 COPY worker.py ./vps/worker.py
-COPY __init__.py ./vps/__init__.py
+COPY vps/__init__.py ./vps/__init__.py
 
 EXPOSE 18080
 
