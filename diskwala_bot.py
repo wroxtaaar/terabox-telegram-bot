@@ -287,20 +287,42 @@ class DiskwalaResolver:
                     media_urls.append(candidate)
                     log.info("DiskWala media response discovered: %s", candidate)
 
+        async def on_request(request):
+            if DISKWALA_API_HOST in request.url and "/api/v1/" in request.url:
+                try:
+                    headers = await request.all_headers()
+                    names = sorted(k.lower() for k in headers)
+                    special = {
+                        "appicrypt": "appicrypt" in {k.lower() for k in headers},
+                        "appicrypt_ts": "appicrypt-ts" in {k.lower() for k in headers},
+                        "cookie": "cookie" in {k.lower() for k in headers},
+                        "authorization": "authorization" in {k.lower() for k in headers},
+                    }
+                    log.info(
+                        "DiskWala official API request method=%s path=%s "
+                        "special_headers=%s header_names=%s",
+                        request.method,
+                        urlparse(request.url).path,
+                        special,
+                        names,
+                    )
+                except Exception as exc:
+                    log.debug("DiskWala request diagnostics failed: %s", exc)
+
         async def on_request_failed(request):
             if DISKWALA_API_HOST in request.url:
-                log.warning("DiskWala API browser request failed: %s %s", request.method, request.url)
+                log.warning(
+                    "DiskWala API browser request failed: %s %s failure=%s",
+                    request.method, request.url, request.failure,
+                )
 
         async def on_download(download):
             downloads.append(download)
 
         try:
-            await context.route(
-                f"**://{DISKWALA_API_HOST}/api/v1/**",
-                lambda route: self._proxy_api(route, context.request),
-            )
             page: Page = await context.new_page()
             page.on("response", on_response)
+            page.on("request", on_request)
             page.on("requestfailed", on_request_failed)
             page.on("download", on_download)
 
