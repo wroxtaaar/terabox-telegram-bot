@@ -125,9 +125,6 @@ DATA_DIR = Path(os.getenv("DATA_DIR", "/worker/data"))
 DOWNLOADS_DIR = Path(os.getenv("DOWNLOADS_DIR", "/tmp/terabox-downloads"))
 UNPACKED_DIR = Path(os.getenv("UNPACKED_DIR", "/tmp/terabox-unpacked"))
 JOBS_FILE = DATA_DIR / "jobs.json"
-DUPLICATE_LINKS_FILE = DATA_DIR / "recent_links.json"
-DUPLICATE_LINK_COOLDOWN_SECONDS = 10 * 60
-
 
 @dataclass(slots=True)
 class QueueTask:
@@ -287,7 +284,6 @@ class Worker:
         self.http_session: aiohttp.ClientSession | None = None
 
         self.jobs: list[dict] = self._load_jobs()
-        self.recent_links: dict[str, float] = self._load_recent_links()
         self.link_counters: dict[str, tuple[str, int]] = {}
 
         log.info(
@@ -312,55 +308,6 @@ class Worker:
         except Exception:
             log.exception("Failed to load jobs from disk")
         return []
-
-    @staticmethod
-    def _load_recent_links() -> dict[str, float]:
-        try:
-            if DUPLICATE_LINKS_FILE.exists():
-                value = json.loads(DUPLICATE_LINKS_FILE.read_text("utf-8"))
-                if isinstance(value, dict):
-                    now = time.time()
-                    return {
-                        str(url): float(timestamp)
-                        for url, timestamp in value.items()
-                        if isinstance(timestamp, (int, float))
-                        and now - float(timestamp) < DUPLICATE_LINK_COOLDOWN_SECONDS
-                    }
-        except Exception:
-            log.exception("Failed to load recent TeraBox links")
-        return {}
-
-    def _save_recent_links(self) -> None:
-        try:
-            DATA_DIR.mkdir(parents=True, exist_ok=True)
-            now = time.time()
-            self.recent_links = {
-                url: timestamp
-                for url, timestamp in self.recent_links.items()
-                if now - timestamp < DUPLICATE_LINK_COOLDOWN_SECONDS
-            }
-            tmp = DUPLICATE_LINKS_FILE.with_suffix(".tmp")
-            tmp.write_text(
-                json.dumps(self.recent_links, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            tmp.replace(DUPLICATE_LINKS_FILE)
-        except Exception:
-            log.exception("Failed to save recent TeraBox links")
-
-    def _check_duplicate_link(self, url: str) -> int | None:
-        normalized = normalize_link(url)
-        if not normalized:
-            return None
-        now = time.time()
-        previous = self.recent_links.get(normalized)
-        if previous is not None:
-            elapsed = now - previous
-            if elapsed < DUPLICATE_LINK_COOLDOWN_SECONDS:
-                return max(1, int(DUPLICATE_LINK_COOLDOWN_SECONDS - elapsed))
-        self.recent_links[normalized] = now
-        self._save_recent_links()
-        return None
 
     def _save_jobs(self) -> None:
         try:
@@ -718,22 +665,6 @@ class Worker:
 
         if self._queue_position() >= MAX_QUEUE_SIZE:
             await event.reply("⚠️ The download queue is full. Please try again later.")
-            return
-
-        remaining_cooldown = self._check_duplicate_link(url)
-        if remaining_cooldown is not None:
-            minutes = max(1, math.ceil(remaining_cooldown / 60))
-            await event.reply(
-                f"⏳ This {source_name(url)} link was already submitted recently. "
-                f"Please wait about {minutes} minute{'s' if minutes != 1 else ''} before sending it again."
-            )
-            log.info(
-                "telegram duplicate %s link rejected chat_id=%s cooldown_remaining=%ss url=%s",
-                source_name(url),
-                chat_id,
-                remaining_cooldown,
-                url,
-            )
             return
 
         task = QueueTask(
