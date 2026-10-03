@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
-from playwright.async_api import Browser, Page
+from playwright.async_api import Browser, Page, async_playwright
 
 
 DISKWALA_HOSTS = {
@@ -263,17 +263,43 @@ class DiskwalaBrowserResolver:
     def __init__(self, *, max_concurrent: int = 1):
         self.max_concurrent = max_concurrent
         self.browser: Browser | None = None
+        self._playwright = None
+        self._owns_browser = False
         self._semaphore: asyncio.Semaphore | None = None
 
-    async def start(self, browser: Browser | None):
-        if not browser:
-            raise RuntimeError("Shared Chromium browser is not started.")
-        self.browser = browser
+    async def start(self, browser: Browser | None = None):
+        # Diskwala needs a browser profile that can execute its real
+        # cross-origin client code. Keep it separate from the TeraBox browser so
+        # the special Chromium flags cannot affect TeraBox handling.
+        if browser is not None:
+            self.browser = browser
+            self._owns_browser = False
+        else:
+            self._playwright = await async_playwright().start()
+            self.browser = await self._playwright.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-web-security",
+                    "--disable-features=VizDisplayCompositor",
+                ],
+            )
+            self._owns_browser = True
+
         self._semaphore = asyncio.Semaphore(self.max_concurrent)
 
     async def stop(self):
-        self.browser = None
         self._semaphore = None
+        if self._owns_browser and self.browser:
+            await self.browser.close()
+        self.browser = None
+        self._owns_browser = False
+        if self._playwright:
+            await self._playwright.stop()
+        self._playwright = None
 
     async def resolve(
         self,
@@ -302,7 +328,6 @@ class DiskwalaBrowserResolver:
                 device_scale_factor=1,
                 extra_http_headers={
                     "Accept-Language": "en-US,en;q=0.9",
-                    "Origin": "https://www.diskwala.com",
                 },
             )
             page = await context.new_page()
