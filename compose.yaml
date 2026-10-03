@@ -2,9 +2,11 @@ services:
   bot:
     build:
       context: .
-      dockerfile: vps/Dockerfile
+      dockerfile: Dockerfile
     env_file:
       - .env
+    environment:
+      PORT: "18080"
     ports:
       - "3000:18080"
     restart: unless-stopped
