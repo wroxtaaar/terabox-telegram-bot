@@ -340,6 +340,16 @@ class DiskwalaBrowserResolver:
                 lower_url = record["url"].lower()
                 content_type = record["content_type"].lower()
 
+                if "/api/v1/file/temp_info" in lower_url or "/api/v1/file/sign" in lower_url:
+                    print(
+                        "Diskwala API response "
+                        + str(record["request_method"])
+                        + " " + record["url"]
+                        + " status=" + str(record["status"])
+                        + " content_type=" + record["content_type"],
+                        flush=True,
+                    )
+
                 is_jsonish = (
                     "json" in content_type
                     or lower_url.endswith(".json")
@@ -388,17 +398,20 @@ class DiskwalaBrowserResolver:
                         flush=True,
                     )
 
-                if "/api/v1/file/temp_info" in lower_url and response.status == 200:
+                if "/api/v1/file/temp_info" in lower_url:
+                    safe_keys = sorted(parsed.keys()) if isinstance(parsed, dict) else []
+                    print(
+                        "Diskwala /file/temp_info response status="
+                        + str(response.status)
+                        + " keys="
+                        + json.dumps(safe_keys, ensure_ascii=False),
+                        flush=True,
+                    )
                     if isinstance(parsed, dict):
                         temp_info_result.clear()
                         temp_info_result.update(parsed)
-                    if isinstance(parsed, dict):
-                        temp_info_result["__filename"] = (
-                            _first_filename(parsed)
-                        )
-                        temp_info_result["__size"] = (
-                            _first_size(parsed)
-                        )
+                        temp_info_result["__filename"] = _first_filename(parsed)
+                        temp_info_result["__size"] = _first_size(parsed)
                     temp_info_event.set()
 
             def capture_request(request):
@@ -544,6 +557,8 @@ class DiskwalaBrowserResolver:
                                 "get the app",
                                 "download the app",
                                 "google play",
+                                "play.google.com",
+                                "apps.apple.com",
                                 "app store",
                                 "youtube",
                                 "telegram",
