@@ -332,6 +332,13 @@ class DiskwalaBrowserResolver:
                 # request its media URL.
                 await page.wait_for_timeout(2500)
 
+                final_path = (urlparse(page.url).path or "").rstrip("/")
+                if final_path == "/404":
+                    raise RuntimeError(
+                        "Diskwala share URL resolved to the site's 404 page. "
+                        "The share may be expired, deleted, invalid, or no longer public."
+                    )
+
                 try:
                     await page.locator("video, audio").first.evaluate(
                         "(el) => { el.muted = true; return el.play().catch(() => null); }"
@@ -663,12 +670,55 @@ class DiskwalaBrowserResolver:
                             or ""
                         ).lower()
 
+                        # Ignore global site/app-navigation links such as
+                        # "Download App" and footer links. A real file download
+                        # control should either be a download attribute/button
+                        # or point at a media/download endpoint.
+                        combined = f"{text_value} {href} {data_url}"
                         if (
-                            "download" in text_value
-                            or "download" in href
-                            or "download" in data_url
-                            or selector.startswith("a[download]")
+                            "download app" in combined
+                            or href.endswith("#download")
+                            or href in {
+                                "https://www.diskwala.com/download",
+                                "https://www.diskwala.com/app",
+                            }
                         ):
+                            continue
+
+                        looks_like_file_control = (
+                            selector.startswith("a[download]")
+                            or "data-download" in selector
+                            or "download" in text_value
+                            or any(
+                                marker in href
+                                for marker in (
+                                    "/download/",
+                                    "/file/",
+                                    "/api/",
+                                    ".mp4",
+                                    ".mkv",
+                                    ".zip",
+                                    ".pdf",
+                                    ".rar",
+                                    ".7z",
+                                )
+                            )
+                            or any(
+                                marker in data_url
+                                for marker in (
+                                    "/download/",
+                                    "/file/",
+                                    "/api/",
+                                    ".mp4",
+                                    ".mkv",
+                                    ".zip",
+                                    ".pdf",
+                                    ".rar",
+                                    ".7z",
+                                )
+                            )
+                        )
+                        if looks_like_file_control:
                             button = candidate
                             break
 
