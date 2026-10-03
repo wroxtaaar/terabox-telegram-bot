@@ -1,6 +1,4 @@
 aiohttp>=3.10,<4
-fastapi>=0.115,<1
-hypercorn>=0.17,<1
 python-dotenv>=1.0,<2
-telethon>=1.41,<2
-playwright>=1.50,<2
+telethon>=1.42,<2
+playwright>=1.55,<2
