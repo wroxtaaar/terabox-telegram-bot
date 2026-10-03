@@ -283,8 +283,7 @@ class DiskwalaBrowserResolver:
                     "--disable-setuid-sandbox",
                     "--disable-dev-shm-usage",
                     "--disable-gpu",
-                    "--disable-web-security",
-                    "--disable-features=VizDisplayCompositor",
+                    "--disable-blink-features=AutomationControlled",
                 ],
             )
             self._owns_browser = True
@@ -317,19 +316,13 @@ class DiskwalaBrowserResolver:
         async with self._semaphore:
             context = await self.browser.new_context(
                 user_agent=(
-                    "Mozilla/5.0 (Linux; Android 13; Mobile) "
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/135.0.0.0 Mobile Safari/537.36"
+                    "Chrome/124.0.0.0 Safari/537.36"
                 ),
                 locale="en-US",
-                viewport={"width": 412, "height": 915},
-                is_mobile=True,
-                has_touch=True,
+                viewport={"width": 1280, "height": 720},
                 device_scale_factor=1,
-                extra_http_headers={
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Origin": "https://www.diskwala.com",
-                },
             )
             page = await context.new_page()
 
@@ -528,7 +521,7 @@ class DiskwalaBrowserResolver:
                 try:
                     await asyncio.wait_for(
                         temp_info_event.wait(),
-                        timeout=8.0,
+                        timeout=12.0,
                     )
                 except asyncio.TimeoutError:
                     pass
@@ -536,7 +529,7 @@ class DiskwalaBrowserResolver:
                 try:
                     await asyncio.wait_for(
                         sign_event.wait(),
-                        timeout=5.0,
+                        timeout=8.0,
                     )
                 except asyncio.TimeoutError:
                     pass
@@ -545,7 +538,7 @@ class DiskwalaBrowserResolver:
                 # Appicrypt is request-specific, so a signature generated for
                 # temp_info must never be reused for a different API call.
 
-                await page.wait_for_timeout(1500)
+                await page.wait_for_timeout(3000)
 
                 # Some builds only sign the download after the user clicks a
                 # play/download control. Never click the site's global
