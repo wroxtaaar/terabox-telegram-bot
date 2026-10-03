@@ -231,6 +231,32 @@ def _json_values_from_text(text: str) -> list[Any]:
     return values
 
 
+def _extract_signed_media_url(data: Any, *, depth: int = 0) -> str:
+    if depth > 7:
+        return ""
+    keys = ("url", "signed_url", "signedUrl", "download_url", "downloadUrl",
+            "stream_url", "streamUrl", "file_url", "fileUrl", "dlink", "link")
+    if isinstance(data, dict):
+        for key in keys:
+            value = data.get(key)
+            candidate = _extract_signed_media_url(value, depth=depth + 1)
+            if candidate and "diskwala.com" not in (urlparse(candidate).hostname or "").lower():
+                return candidate
+        for value in data.values():
+            candidate = _extract_signed_media_url(value, depth=depth + 1)
+            if candidate and "diskwala.com" not in (urlparse(candidate).hostname or "").lower():
+                return candidate
+    elif isinstance(data, list):
+        for value in data[:100]:
+            candidate = _extract_signed_media_url(value, depth=depth + 1)
+            if candidate:
+                return candidate
+    elif isinstance(data, str):
+        for candidate in _extract_url_strings(data):
+            if "diskwala.com" not in (urlparse(candidate).hostname or "").lower() and not _is_bad_asset(candidate):
+                return candidate
+    return ""
+
 class DiskwalaBrowserResolver:
     """Resolve public Diskwala share pages without a paid API."""
 
