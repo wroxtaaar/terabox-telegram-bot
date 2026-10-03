@@ -309,6 +309,7 @@ class DiskwalaBrowserResolver:
             response_bodies: list[str] = []
             api_sign_result: dict[str, Any] = {}
             temp_info_result: dict[str, Any] = {}
+            last_api_request_headers: dict[str, str] = {}
 
             sign_event = asyncio.Event()
             temp_info_event = asyncio.Event()
